@@ -560,7 +560,7 @@ async def nomi_destinations_sync(sid, data):
 @sio.event
 async def nomi_task_cancel(sid, data):
     task_id = str((data or {}).get('task_id', '')).strip()
-    if nomi_bridge is not None:
+    if nomi_bridge is not None and hasattr(nomi_bridge, 'cancel_all_navigation'):
         nomi_bridge.cancel_all_navigation()
     if not task_id or task_id == 'all' or nomi_task_owners.get(task_id) != sid or nomi_active_task_id != task_id:
         if nomi_bridge is not None and nomi_bridge.available and nomi_bridge.agent_connected:
@@ -665,6 +665,11 @@ async def nomi_get_status(sid):
         'message': 'NOMI Agent 연결됨' if connected else 'NOMI Agent 연결 안 됨',
         'active_model': nomi_active_model,
     }, to=sid)
+    active_id = nomi_active_task_id or nomi_recent_task_id
+    if active_id and active_id in nomi_task_payloads:
+        nomi_task_owners[active_id] = sid
+        payload = nomi_task_payloads[active_id]
+        await sio.emit('nomi_task_status', payload, to=sid)
 
 CLIENT_DIST_DIR = Path(__file__).resolve().parent.parent / "client" / "dist"
 if (CLIENT_DIST_DIR / "assets").exists():
@@ -1066,7 +1071,7 @@ async def move_command(sid, data):
 
     # Stops are safety commands: never reject them because of movement throttling.
     if direction == 'stop':
-        if nomi_bridge is not None:
+        if nomi_bridge is not None and hasattr(nomi_bridge, 'send_direction'):
             nomi_bridge.send_direction('stop')
         if not remote_core.connected:
             update_client_state(sid, timestamp=current_time)
@@ -1090,7 +1095,7 @@ async def move_command(sid, data):
     # issue autonomous navigation commands through a hand-crafted socket call.
     if direction == 'drive_vector':
         if not remote_core.connected:
-            if nomi_bridge is not None:
+            if nomi_bridge is not None and hasattr(nomi_bridge, 'send_direction'):
                 nomi_bridge.send_direction('drive_vector', speed, angular, linear_x, linear_y)
             update_client_state(sid, timestamp=current_time)
             await emit_command_status(
@@ -1156,7 +1161,7 @@ async def move_command(sid, data):
 
     # 정지 및 긴급 정지 명령은 rate limit이나 throttle 검사를 완전히 우회하여 0ms 즉각 처리
     if direction == 'stop':
-        if nomi_bridge is not None:
+        if nomi_bridge is not None and hasattr(nomi_bridge, 'send_direction'):
             nomi_bridge.send_direction('stop')
         update_client_state(sid, timestamp=current_time)
         await emit_command_status(
@@ -1188,7 +1193,7 @@ async def move_command(sid, data):
         return
 
     if not remote_core.connected:
-        if nomi_bridge is not None:
+        if nomi_bridge is not None and hasattr(nomi_bridge, 'send_direction'):
             nomi_bridge.send_direction(direction, speed, angular, linear_x, linear_y)
         update_client_state(sid, timestamp=current_time)
         await emit_command_status(
@@ -1209,7 +1214,7 @@ async def move_command(sid, data):
 
     # Execute robot command
     try:
-        if nomi_bridge is not None:
+        if nomi_bridge is not None and hasattr(nomi_bridge, 'send_direction'):
             nomi_bridge.send_direction(direction, speed, angular, linear_x, linear_y)
         result = await remote_core.move(
             direction, speed, angular, linear_x, linear_y, sequence=sequence,

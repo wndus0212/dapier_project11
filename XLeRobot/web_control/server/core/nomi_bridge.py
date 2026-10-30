@@ -448,7 +448,6 @@ class NomiBridge:
         elif direction == 'stop':
             lx = 0.0
             az = 0.0
-            self.cancel_all_navigation()
 
         return self.send_cmd_vel(lx, az)
 
