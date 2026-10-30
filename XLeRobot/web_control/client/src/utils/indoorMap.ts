@@ -1,20 +1,24 @@
 import type { StaticObstacle } from './pathPlanner';
 import destinationMap from '../../../shared/navigation_destinations.json';
 
-/** MuJoCo test map expressed in the chassis/map frame used by /pose and scans. */
+/** SLAM map (my_map.yaml) and AMR waypoints */
 export const INDOOR_MAP = {
-  source: 'mujoco_static' as const,
-  frameId: 'xlerobot_map',
-  resolution: 0.25,
-  bounds: { minX: -5, maxX: 5, minY: -4, maxY: 8 },
-  doorway: { wall: 'south', width: 1.8 },
-  start: { x: 0, y: 0 },
-  charging: { x: destinationMap.destinations[3].x, y: destinationMap.destinations[3].y },
-  tables: [
-    { name: '테이블 1', x: -2.45, y: 1.1, halfWidth: 0.7, halfHeight: 0.45, approach: { x: destinationMap.destinations[0].x, y: destinationMap.destinations[0].y } },
-    { name: '테이블 2', x: 0, y: 3.0, halfWidth: 0.7, halfHeight: 0.45, approach: { x: destinationMap.destinations[1].x, y: destinationMap.destinations[1].y } },
-    { name: '테이블 3', x: 2.45, y: 1.1, halfWidth: 0.7, halfHeight: 0.45, approach: { x: destinationMap.destinations[2].x, y: destinationMap.destinations[2].y } },
-  ],
+  source: 'slam_my_map' as const,
+  frameId: 'map',
+  resolution: 0.05,
+  bounds: { minX: -5.285, maxX: 9.815, minY: -13.490, maxY: 1.310 },
+  image: '/my_map.png',
+  start: {
+    x: destinationMap.destinations[0]?.x ?? -0.59,
+    y: destinationMap.destinations[0]?.y ?? -0.88,
+    yaw: (((destinationMap.destinations[0] as any)?.yaw ?? -17.1) * Math.PI) / 180,
+  },
+  charging: {
+    x: destinationMap.destinations[0]?.x ?? -0.59,
+    y: destinationMap.destinations[0]?.y ?? -0.88,
+    yaw: (((destinationMap.destinations[0] as any)?.yaw ?? -17.1) * Math.PI) / 180,
+  },
+  tables: [] as Array<{ name: string; x: number; y: number; halfWidth: number; halfHeight: number; approach: { x: number; y: number } }>,
 } as const;
 
 export const INDOOR_STATIC_OBSTACLES: StaticObstacle[] = INDOOR_MAP.tables.map(table => ({
@@ -25,15 +29,20 @@ export const INDOOR_STATIC_OBSTACLES: StaticObstacle[] = INDOOR_MAP.tables.map(t
   halfHeight: table.halfHeight,
 }));
 
-export const TABLE_APPROACH_DESTINATIONS = INDOOR_MAP.tables.map(({ name, approach }) => ({
-  name,
-  ...approach,
-}));
+export const TABLE_APPROACH_DESTINATIONS = destinationMap.destinations
+  .filter(item => item.kind !== 'charging')
+  .map(item => ({
+    name: item.name,
+    x: item.x,
+    y: item.y,
+    yaw: (item as any).yaw ?? 0,
+  }));
 
 export const CHARGING_DESTINATION = {
-  name: destinationMap.destinations[3].name,
-  x: destinationMap.destinations[3].x,
-  y: destinationMap.destinations[3].y,
+  name: destinationMap.destinations[0]?.name ?? '홈 스테이션',
+  x: destinationMap.destinations[0]?.x ?? -1.41,
+  y: destinationMap.destinations[0]?.y ?? -1.39,
+  yaw: (destinationMap.destinations[0] as any)?.yaw ?? -15.5,
 };
 
 export const NAVIGATION_DESTINATIONS = destinationMap.destinations;

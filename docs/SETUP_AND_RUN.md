@@ -101,7 +101,7 @@ source .env
 set +a
 ~~~
 
-NOMI_MODEL_PROFILE=qwen35_single, OLLAMA_HOST=http://127.0.0.1:11434, ROS_DOMAIN_ID=222를 확인합니다. .env는 Git에서 제외됩니다. Qwen3.5 Ollama 프로필에는 API 키가 필요하지 않습니다.
+NOMI_MODEL_PROFILE=qwen35_single, OLLAMA_HOST=http://127.0.0.1:11434, ROS_DOMAIN_ID=30을 확인합니다. .env는 Git에서 제외됩니다. Qwen3.5 Ollama 프로필에는 API 키가 필요하지 않습니다.
 
 ## 6. 웹 프런트엔드
 
@@ -120,47 +120,43 @@ pnpm run build
 
 ## 7. 실행 순서
 
-각 항목을 별도 터미널에서 실행합니다. ROS_DOMAIN_ID=222를 모든 ROS 터미널에서 동일하게 사용합니다.
+각 항목을 별도 터미널에서 실행합니다. ROS_DOMAIN_ID=30을 모든 ROS 터미널에서 동일하게 사용합니다.
 
-### 터미널 1 — MuJoCo Host
+### 터미널 1 — Ollama LLM 서버 및 시뮬레이터 / 로봇
+
+~~~
+# Ollama 백그라운드 서비스 기동 (미기동 시)
+ollama serve
+
+# 시뮬레이터 (MuJoCo 또는 AprilTag 비전 시뮬레이터 또는 실제 로봇)
+# A) 실제 AMR 로봇 구동 시:
+# export ROS_DOMAIN_ID=30 && ros2 launch amr_bringup autonav.launch.py
+# B) AprilTag 비전 인터랙티브 시뮬레이터 구동 시:
+# export ROS_DOMAIN_ID=30 && python3 ~/ros2_amr_ws/tools/sim_docking_interactive.py --port 8090
+~~~
+
+### 터미널 2 — NOMI Agent (LLM 자연어 에이전트)
 
 ~~~
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
 source ~/venvs/xlerobot_mujoco/bin/activate
-export ROS_DOMAIN_ID=222
-ros2 run nomi_xlerobot_sim mujoco_host
-~~~
-
-Host가 scene.xml을 열고 ZMQ 포트 5555/5556을 사용해야 합니다.
-
-### 터미널 2 — NOMI Agent
-
-~~~
-source /opt/ros/jazzy/setup.bash
-source ~/ros2_ws/install/setup.bash
-source ~/venvs/xlerobot_mujoco/bin/activate
-export ROS_DOMAIN_ID=222
+export ROS_DOMAIN_ID=30
 export NOMI_MODEL_PROFILE=qwen35_single
 export OLLAMA_HOST=http://127.0.0.1:11434
-ros2 run nomi_agent agent
+python3 ~/ros2_ws/install/nomi_agent/lib/nomi_agent/agent
 ~~~
 
-### 터미널 3 — 웹 백엔드
+### 터미널 3 — 웹 백엔드 (FastAPI + Socket.IO + ROS 2 Bridge)
 
 ~~~
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
 source ~/venvs/xlerobot_mujoco/bin/activate
 cd ~/XLeRobot/web_control/server
-export ROS_DOMAIN_ID=222
-export ROBOT_TYPE=mujoco
-export ROBOT_HOST=127.0.0.1
-export ROBOT_PORT_CMD=5555
-export ROBOT_PORT_DATA=5556
+export ROS_DOMAIN_ID=30
 export UI_HOST=0.0.0.0
 export UI_PORT=8000
-export NOMI_MUJOCO_NAV_ENABLED=1
 python main.py
 ~~~
 

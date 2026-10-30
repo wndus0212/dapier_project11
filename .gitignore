@@ -85,3 +85,6 @@ models/cache/
 *.backup
 *.orig
 *.old
+
+*.egg-info/
+last_robot_pose.json

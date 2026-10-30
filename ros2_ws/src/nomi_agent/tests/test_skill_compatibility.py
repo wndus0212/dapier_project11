@@ -28,11 +28,17 @@ class Publisher:
                 callback(types.SimpleNamespace(data=json.dumps(result)))
 
 
+class MockCallbackGroup:
+    def add_entity(self, entity):
+        pass
+
+
 class MockNode:
     def __init__(self):
         self.publishers = {}
         self.subscriptions = {}
         self.auto_navigation_result = None
+        self.default_callback_group = MockCallbackGroup()
 
     def create_publisher(self, message_type, topic, _depth):
         publisher = Publisher(self, topic)
@@ -65,7 +71,12 @@ def ros_message_stubs():
         def __init__(self):
             self.data = ""
 
+    class Bool:
+        def __init__(self):
+            self.data = False
+
     std_msg.String = String
+    std_msg.Bool = Bool
     std.msg = std_msg
     return {"geometry_msgs": geometry, "geometry_msgs.msg": geometry_msg, "std_msgs": std, "std_msgs.msg": std_msg}
 

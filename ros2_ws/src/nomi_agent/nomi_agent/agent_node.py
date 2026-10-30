@@ -25,7 +25,16 @@ class NomiAgentNode(Node):
 
         self.response_publisher = self.create_publisher(String, "/nomi/response", 10)
         self.task_status_publisher = self.create_publisher(String, "/nomi/task_status", 10)
-        self.model_status_publisher = self.create_publisher(String, "/nomi/model_status", 10)
+        model_status_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.model_status_publisher = self.create_publisher(String, "/nomi/model_status", model_status_qos)
+        # Publish initial active profile latched so bridges/UIs receive it immediately
+        init_model_msg = String()
+        init_model_msg.data = self.llm_client.profile
+        self.model_status_publisher.publish(init_model_msg)
         self.harness = ExecutionHarness(
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
@@ -111,8 +120,8 @@ class NomiAgentNode(Node):
             status.data = requested
             self.get_logger().info(f"모델 프로필 변경 완료: {requested}")
         except Exception as exc:
-            status.data = f"ERROR: {requested} 프로필 활성화 실패: {exc}"
-            self.get_logger().error(status.data)
+            status.data = f"ERROR: {exc}"
+            self.get_logger().error(f"모델 프로필 변경 실패: {exc}")
         self.model_status_publisher.publish(status)
 
     def publish_response(self, text):
@@ -136,13 +145,25 @@ def main(args=None):
     node = NomiAgentNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
-        node.harness.cancel_active()
-        node.tool_registry.emergency_stop()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.harness.cancel_active()
+            if rclpy.ok():
+                node.tool_registry.emergency_stop()
+        except Exception:
+            pass
+        finally:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+            if rclpy.ok():
+                try:
+                    rclpy.shutdown()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

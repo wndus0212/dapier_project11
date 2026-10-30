@@ -51,6 +51,7 @@ export function computeWaypointCommand(
   maxSpeed: number,
   previousTurnDirection: number | null = null,
   actualYawRate = 0,
+  isFinalWaypoint = false,
 ): WaypointCommand {
   const dx = target.x - pose.x;
   const dy = target.y - pose.y;
@@ -65,29 +66,32 @@ export function computeWaypointCommand(
   const settled = Math.abs(yawRate) <= ARRIVAL_YAW_RATE_RAD_S;
   const rawAngular = ANGULAR_GAIN * steeringError - ANGULAR_DAMPING_GAIN * yawRate;
   const pdAngular = Math.max(-MAX_ANGULAR_SPEED_RAD_S, Math.min(MAX_ANGULAR_SPEED_RAD_S, rawAngular));
-  const aligned = Math.abs(headingError) <= DRIVE_ALIGNMENT_RAD;
-  // Preserve the old angular deadband once the chassis has actually settled.
-  // While it still has momentum, keep linear velocity at zero and command
-  // counter-torque until measured yaw rate falls below the settle threshold.
+  const absHeading = Math.abs(headingError);
+  const aligned = absHeading <= DRIVE_ALIGNMENT_RAD;
   const angular = aligned && settled ? 0 : pdAngular;
   const damping = angular * yawRate < 0;
 
-  if (distance <= ARRIVAL_RADIUS_M && settled) {
-    return { distance, desiredYaw, headingError, steeringError, angular: 0, linearX: 0, linearY: 0, turnDirection, phase: 'arrived', damping: false };
+  if (isFinalWaypoint) {
+    if (distance <= ARRIVAL_RADIUS_M && settled) {
+      return { distance, desiredYaw, headingError, steeringError, angular: 0, linearX: 0, linearY: 0, turnDirection, phase: 'arrived', damping: false };
+    }
+    if (distance <= ARRIVAL_RADIUS_M || (aligned && !settled)) {
+      return { distance, desiredYaw, headingError, steeringError, angular, linearX: 0, linearY: 0, turnDirection, phase: 'braking', damping };
+    }
   }
 
-  if (distance <= ARRIVAL_RADIUS_M || (aligned && !settled)) {
-    return { distance, desiredYaw, headingError, steeringError, angular, linearX: 0, linearY: 0, turnDirection, phase: 'braking', damping };
+  // Only stop linear drive to rotate in place if heading error is large (> 0.75 rad ~ 43 deg)
+  if (absHeading > 0.75 || maxSpeed <= 0) {
+    return { distance, desiredYaw, headingError, steeringError, angular: pdAngular, linearX: 0, linearY: 0, turnDirection, phase: 'aligning', damping };
   }
 
-  // Do not strafe while facing away from the segment. This removes the
-  // competing rotate-and-sideways motion that obscured heading errors.
-  if (Math.abs(headingError) > DRIVE_ALIGNMENT_RAD || maxSpeed <= 0) {
-    return { distance, desiredYaw, headingError, steeringError, angular, linearX: 0, linearY: 0, turnDirection, phase: 'aligning', damping };
-  }
+  // Smooth unicycle forward drive: scale smoothly with cos(headingError) when slightly off-heading
+  const forwardScale = Math.max(0.4, Math.cos(headingError));
+  const rawSpeed = isFinalWaypoint
+    ? Math.min(maxSpeed, Math.max(0.25, Math.sqrt(1.5 * Math.max(0, distance - ARRIVAL_RADIUS_M))))
+    : maxSpeed;
+  const driveSpeed = rawSpeed * forwardScale;
 
-  const brakingSpeed = Math.sqrt(1.5 * Math.max(0, distance - ARRIVAL_RADIUS_M));
-  const driveSpeed = Math.min(maxSpeed, brakingSpeed);
   return {
     distance,
     desiredYaw,
@@ -123,6 +127,7 @@ export class NavigationMotionGuard {
   private uncommandedSpinSince: number | null = null;
   private divergenceSince: number | null = null;
   private previousDistance: number | null = null;
+  private minAchievedDistance: number = Number.POSITIVE_INFINITY;
 
   reset() {
     this.wrongWaySince = null;
@@ -132,6 +137,7 @@ export class NavigationMotionGuard {
     this.uncommandedSpinSince = null;
     this.divergenceSince = null;
     this.previousDistance = null;
+    this.minAchievedDistance = Number.POSITIVE_INFINITY;
   }
 
   observe(sample: MotionSafetySample): string | null {
@@ -179,12 +185,21 @@ export class NavigationMotionGuard {
       this.uncommandedSpinSince = null;
     }
 
-    if (this.previousDistance !== null && sample.distance > this.previousDistance + 0.015) {
+    // 목표 이탈(Divergence) 안전 검사:
+    // 전진 주행 명령이 내려진 상태에서 거리가 최근 최단거리보다 25cm 이상 계속 멀어지는 경우만 감지 (3.5초 유예)
+    const isDrivingForward = commandMagnitude > 0.05;
+    if (sample.distance < this.minAchievedDistance) {
+      this.minAchievedDistance = sample.distance;
+      this.divergenceSince = null;
+    } else if (isDrivingForward && sample.distance > this.minAchievedDistance + 0.25) {
       this.divergenceSince ??= sample.nowMs;
-      if (sample.nowMs - this.divergenceSince >= 1600) return '목적지까지의 거리가 지속해서 증가해 주행을 정지했습니다.';
-    } else if (this.previousDistance === null || sample.distance < this.previousDistance - 0.025) {
+      if (sample.nowMs - this.divergenceSince >= 3500) {
+        return '목적지까지의 거리가 지속해서 증가해 주행을 정지했습니다.';
+      }
+    } else if (sample.distance <= (this.previousDistance ?? sample.distance) + 0.015) {
       this.divergenceSince = null;
     }
+
     this.previousDistance = sample.distance;
     return null;
   }

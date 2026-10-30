@@ -7,6 +7,7 @@ REQUIRED_FIELDS = {
     "navigate_to": "location",
     "pick_object": "object_name",
     "place_object": "location",
+    "fold_towel": "confirm",
 }
 
 QUESTIONS = {
@@ -18,6 +19,8 @@ QUESTIONS = {
         "물체를 어디에 놓을까요? 장소를 구체적으로 알려주세요.",
     ("place_object", "object_name"):
         "테이블에 무엇을 놓을까요? 놓을 물체를 지정하거나 먼저 집을 물체를 알려주세요.",
+    ("fold_towel", "confirm"):
+        "로봇 팔이 움직입니다. 작업대에 수건이 펴져 있고 팔 주변이 비어 있나요? 시작할까요?",
 }
 
 # 단독으로는 대상을 특정할 수 없는 표현들
@@ -36,7 +39,8 @@ PLACE_OBJECT_PATTERN = re.compile(
 ROBOT_COMMAND_PATTERN = re.compile(
     r"이동|움직|전진|후진|회전|돌아|집어|잡아|놓아|놓아\s*줘|놔\s*줘|올려|내려|옮겨|"
     r"그리퍼.*(?:열|닫)|(?:열|닫)아\s*(?:줘|라)|(?:앞으로|뒤로)\s*가|"
-    r"[가-힣A-Za-z0-9][가-힣A-Za-z0-9 _-]{0,40}?(?:으로|로|에)\s*(?:가자|가줘|돌아가|이동(?:해|해줘|하세요)?|가(?:[\s.!?]|$))|"
+    r"수건.*(?:접|개)|(?:수건.*)?(?:접어|개어)(?:\s*줘|\s*봐)?|"
+    r"[가-힣A-Za-z0-9][가-힣A-Za-z0-9 _-]{0,40}?(?:으로|로|에)\s*(?:가자|가줘|가서|가고|돌아가|이동(?:해|해줘|하세요|해서)?|가(?:[\s.!?]|$))|"
     r"날씨.*알려|위치.*알려|로봇\s*상태.*알려|배터리.*알려",
     re.IGNORECASE,
 )
@@ -57,6 +61,13 @@ NEGATIVE_PATTERNS = {
         r"닫지\s*말",
         r"닫지\s*않",
         r"닫으면\s*안\s*돼",
+    ],
+    "fold_towel": [
+        r"접지\s*마",
+        r"접으면\s*안",
+        r"접지\s*말",
+        r"개지\s*마",
+        r"개면\s*안",
     ],
 }
 
@@ -85,8 +96,15 @@ def classify_no_tool_command(user_text):
     text = user_text if isinstance(user_text, str) else ""
     for intent, patterns in NEGATIVE_PATTERNS.items():
         if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns):
-            action = "열기" if intent == "open_gripper" else "닫기"
-            return "NON_ACTION", f"알겠습니다. 그리퍼 {action} 동작은 수행하지 않겠습니다."
+            if intent == "open_gripper":
+                action = "그리퍼 열기"
+            elif intent == "close_gripper":
+                action = "그리퍼 닫기"
+            elif intent == "fold_towel":
+                action = "수건 접기"
+            else:
+                action = intent
+            return "NON_ACTION", f"알겠습니다. {action} 동작은 수행하지 않겠습니다."
     if ROBOT_COMMAND_PATTERN.search(text):
         return "ROBOT_TASK", "요청한 동작을 선택할 도구 호출이 확인되지 않았습니다. 대상과 목적지를 구체적으로 알려주세요."
     return "CHAT", ""
@@ -95,17 +113,17 @@ def classify_no_tool_command(user_text):
 def extract_navigation_destination(user_text):
     """Extract only an explicit place from a Korean named-navigation request."""
     text = user_text if isinstance(user_text, str) else ""
-    if not re.search(r"(?:가자|가줘|가요|가세요|돌아가|이동(?:해|해줘|하세요)?|향해|찾아가|가(?:[\s.!?]|$)|\bgo\b|\bhead\b)", text, re.IGNORECASE):
+    if not re.search(r"(?:가자|가줘|가요|가세요|가서|가고|돌아가|이동(?:해|해줘|하세요|해서)?|향해|찾아가|가(?:[\s.!?]|$)|\bgo\b|\bhead\b)", text, re.IGNORECASE):
         return None
     if re.search(r"(?:집|home)", text, re.IGNORECASE):
         return "집"
     charging = re.search(r"충전\s*(?:도크|소)|도킹\s*스테이션|충전기|\bdock\b|\bcharging\s+station\b", text, re.IGNORECASE)
     if charging:
         return charging.group(0)
-    if re.search(r"(?:저장된\s*)?(?:목적지|장소)(?:로|으로)?\s*(?:가자|가줘|가요|가세요|가|이동(?:해|해줘|하세요)?)", text):
+    if re.search(r"(?:저장된\s*)?(?:목적지|장소)(?:로|으로)?\s*(?:가자|가줘|가요|가세요|가서|가고|가|이동(?:해|해줘|하세요|해서)?)", text):
         return "저장된 목적지"
     match = re.search(
-        r"(?P<name>[가-힣A-Za-z0-9][가-힣A-Za-z0-9 _-]{0,78}?)(?:으로|로|에)\s*(?:돌아가|가자|가줘|가요|가세요|가(?:[\s.!?]|$)|이동(?:해|해줘|하세요)?|향해|찾아가)",
+        r"(?P<name>[가-힣A-Za-z0-9][가-힣A-Za-z0-9 _-]{0,78}?)(?:으로|로|에)\s*(?:돌아가|가자|가줘|가요|가세요|가서|가고|가(?:[\s.!?]|$)|이동(?:해|해줘|하세요|해서)?|향해|찾아가)",
         text,
         re.IGNORECASE,
     )
@@ -162,8 +180,12 @@ def validate_actions(user_text, actions, tool_registry=None, *, held_object=Fals
         if any(re.search(pattern, user_text, re.IGNORECASE) for pattern in patterns):
             return False, [], "금지한 동작이 포함되어 있어 작업을 실행하지 않았습니다."
 
+        if intent == "fold_towel":
+            if arguments.get("confirm") is not True:
+                return False, [], QUESTIONS[("fold_towel", "confirm")]
+
         field = REQUIRED_FIELDS.get(intent)
-        if field:
+        if field and intent != "fold_towel":
             value = arguments.get(field)
 
             if intent == "navigate_to":
@@ -181,7 +203,17 @@ def validate_actions(user_text, actions, tool_registry=None, *, held_object=Fals
                     table_alias = re.fullmatch(r"(\d+)번?테이블", compact_requested)
                     if table_alias:
                         compact_requested = f"테이블{table_alias.group(1)}"
-                    if compact_requested != compact_value:
+                    matched = (compact_requested == compact_value)
+                    if not matched and tool_registry is not None and hasattr(tool_registry, "_resolve_destination"):
+                        res_req = tool_registry._resolve_destination(requested_destination)
+                        res_val = tool_registry._resolve_destination(str(value))
+                        if res_req and res_val and res_req.get("name") == res_val.get("name"):
+                            matched = True
+                        elif res_req and res_req.get("name") == str(value):
+                            matched = True
+                        elif res_val and compact_requested in [re.sub(r"\s+", "", a).casefold() for a in res_val.get("aliases", [])]:
+                            matched = True
+                    if not matched:
                         return False, [], "말씀하신 목적지를 확인할 수 없습니다. 등록된 목적지 이름을 그대로 알려주세요."
 
             if _is_ambiguous(value):

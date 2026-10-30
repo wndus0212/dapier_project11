@@ -8,6 +8,7 @@ with robot hosts via ZeroMQ.
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional
 
@@ -44,13 +45,14 @@ class RemoteCore:
         self._receiver_task: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
 
-        # Robot state cache
+        # Robot state cache (Default to Home Station: -0.59, -0.88, -17.1 deg)
+        home_yaw = math.radians(-17.1)
         self.robot_state = {
             'status': 'disconnected',
-            'position': {'x': 0.0, 'y': 0.0, 'z': 0.0},
-            'rotation': {'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0},
+            'position': {'x': -0.59, 'y': -0.88, 'z': 0.0},
+            'rotation': {'roll': 0.0, 'pitch': 0.0, 'yaw': home_yaw},
             'arm_joints': {'left': [0.0] * 6, 'right': [0.0] * 6},
-            'base_joints': [0.0, 0.0, 0.0],  # x, y, rotation
+            'base_joints': [-0.59, -0.88, home_yaw],
             'velocity': {
                 'linear': {'x': 0.0, 'y': 0.0, 'z': 0.0},
                 'angular': {'x': 0.0, 'y': 0.0, 'z': 0.0}

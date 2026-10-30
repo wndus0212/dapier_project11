@@ -35,9 +35,9 @@ type HarnessTask = {
 type ChatMessage = { id: string; role: 'user' | 'nomi' | 'system'; text: string; taskId?: string };
 
 const MODEL_OPTIONS = [
-  { value: 'qwen_hermes', label: 'Qwen + Hermes' },
-  { value: 'qwen35_single', label: 'Qwen3.5 9B (Single)' },
-  { value: 'doubao_pro', label: 'Doubao Pro (Router + Worker)' },
+  { value: 'qwen35_single', label: 'Qwen3.5 9B (Single) · 기본(설치됨)' },
+  { value: 'qwen_hermes', label: 'Qwen 2.5 7B + Hermes 3 8B (다운로드 필요)' },
+  { value: 'doubao_pro', label: 'Doubao Pro (Ark API 키 필요)' },
   { value: 'qwen_doubao', label: 'Qwen Router + Doubao Worker' },
   { value: 'doubao_hermes', label: 'Doubao Router + Hermes Worker' },
 ];
@@ -67,20 +67,56 @@ function textFromPayload(data: unknown): string {
   return '';
 }
 
+type LogEntry = {
+  id: string;
+  time: string;
+  level: 'info' | 'success' | 'warn' | 'error';
+  message: string;
+};
+
 export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'light' | 'dark' }) {
   const [text, setText] = useState('');
   const [validateOnly, setValidateOnly] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tasks, setTasks] = useState<Record<string, HarnessTask>>({});
-  const [activeModel, setActiveModel] = useState('');
-  const [selectedModel, setSelectedModel] = useState('');
+  const [activeModel, setActiveModel] = useState('qwen35_single');
+  const [selectedModel, setSelectedModel] = useState('qwen35_single');
   const [modelSwitchPending, setModelSwitchPending] = useState(false);
+  const activeModelRef = useRef('qwen35_single');
+  const modelSwitchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [bridgeConnected, setBridgeConnected] = useState(false);
+  const bridgeConnectedRef = useRef<boolean | null>(null);
   const [listening, setListening] = useState(false);
+  const [logs, setLogs] = useState<LogEntry[]>([
+    { id: 'init', time: new Date().toLocaleTimeString(), level: 'info', message: 'NOMI 제어 콘솔 초기화 완료' }
+  ]);
+  const [showLogs, setShowLogs] = useState(true);
+  const [elapsedSec, setElapsedSec] = useState<number>(0);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const knownResponseRef = useRef(new Set<string>());
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const dark = theme === 'dark';
   const busyTask = Object.values(tasks).find(task => task.submitting || (task.status && !TERMINAL_STATUSES.has(task.status)));
+
+  const addLog = (level: 'info' | 'success' | 'warn' | 'error', message: string) => {
+    const timeStr = new Date().toLocaleTimeString();
+    setLogs(previous => [...previous.slice(-40), { id: requestId(), time: timeStr, level, message }]);
+  };
+
+  useEffect(() => {
+    if (busyTask) {
+      const startTime = Date.now();
+      timerRef.current = setInterval(() => {
+        setElapsedSec(Math.round((Date.now() - startTime) / 100) / 10);
+      }, 100);
+    } else {
+      if (timerRef.current) clearInterval(timerRef.current);
+      setElapsedSec(0);
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [Boolean(busyTask)]);
 
   useEffect(() => {
     if (!socket) {
@@ -93,6 +129,15 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
         ...previous,
         [data.task_id]: { ...data, submitting: false, cancelRequested: previous[data.task_id]?.cancelRequested },
       }));
+      const label = STATUS_LABEL[data.status] || data.status;
+      addLog(
+        data.status === 'SUCCEEDED' ? 'success' : data.status === 'FAILED' ? 'error' : 'info',
+        `📊 [상태 갱신] ${label} (ID: ${data.task_id.slice(0, 8)}…)`
+      );
+      if (data.steps && data.steps.length > 0) {
+        const lastStep = data.steps[data.steps.length - 1];
+        addLog('info', `🔧 [도구 실행] ${lastStep.tool || '도구'}: ${lastStep.message || (lastStep.success ? '완료' : '실행 중')}`);
+      }
       if (data.response_text && !knownResponseRef.current.has(data.task_id)) {
         knownResponseRef.current.add(data.task_id);
         setMessages(previous => [...previous, {
@@ -100,9 +145,15 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
         }]);
       }
     };
+    const onCommandReceived = (data: { status?: string; request_id?: string; text?: string }) => {
+      addLog('info', `🚀 [웹 서버] ROS 2 브리지 접수 (${data.status || 'OK'}): "${data.text || ''}"`);
+    };
     const onResponse = (data: unknown) => {
       const payload = data as { status?: string; message?: string; request_id?: string } | null;
       const message = textFromPayload(data);
+      if (message) {
+        addLog(payload?.status === 'error' ? 'error' : 'info', `💬 [응답] ${message}`);
+      }
       if (message && payload?.status === 'error') {
         if (payload.request_id) {
           setTasks(previous => {
@@ -114,38 +165,83 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
         setMessages(previous => [...previous, { id: requestId(), role: 'system', text: message }]);
       }
     };
-    const onBridgeStatus = (data: { connected?: boolean }) => setBridgeConnected(data?.connected === true);
+    const onBridgeStatus = (data: { connected?: boolean; active_model?: string }) => {
+      const isConn = data?.connected === true;
+      setBridgeConnected(isConn);
+      if (bridgeConnectedRef.current !== isConn) {
+        bridgeConnectedRef.current = isConn;
+        addLog(isConn ? 'success' : 'warn', `🔗 [브리지] ${isConn ? 'NOMI Agent ROS 2 브리지 연결됨' : 'NOMI Agent 연결 끊김'}`);
+      }
+      if (data?.active_model) {
+        setActiveModel(data.active_model);
+        activeModelRef.current = data.active_model;
+      }
+    };
     const onModelStatus = (data: { profile?: string; status?: string; message?: string; request_id?: string; label?: string } | null) => {
+      if (modelSwitchTimeoutRef.current) {
+        clearTimeout(modelSwitchTimeoutRef.current);
+        modelSwitchTimeoutRef.current = null;
+      }
       setModelSwitchPending(false);
       if (data?.status === 'success' && data.profile) {
+        const changed = data.profile !== activeModelRef.current;
+        const isUserRequest = Boolean(data.request_id);
         setActiveModel(data.profile);
+        activeModelRef.current = data.profile;
         setSelectedModel(data.profile);
         const label = data.label || MODEL_OPTIONS.find(option => option.value === data.profile)?.label || data.profile;
-        setMessages(previous => [...previous, { id: requestId(), role: 'system', text: `모델 변경 완료: ${label}` }]);
+        if (changed || isUserRequest) {
+          addLog('success', `🤖 [모델 변경 완료] ${label}`);
+          setMessages(previous => [...previous, { id: requestId(), role: 'system', text: `모델 변경 완료: ${label}` }]);
+        }
       } else {
-        setSelectedModel(activeModel);
+        setSelectedModel(activeModelRef.current);
+        addLog('error', `❌ [모델 변경 실패] ${data?.message || '실패'}`);
         setMessages(previous => [...previous, { id: requestId(), role: 'system', text: data?.message || '모델 변경에 실패했습니다.' }]);
       }
     };
-    const onModelSwitchSent = () => setModelSwitchPending(true);
+    const onModelSwitchSent = () => {
+      setModelSwitchPending(true);
+      addLog('info', '⏳ [모델 변경 요청 전송 중…]');
+    };
     const onCancelResult = (data: { status?: string; task_id?: string; message?: string }) => {
       if (data?.status === 'accepted' && data.task_id) {
+        addLog('warn', `🛑 [작업 취소 접수] ID: ${data.task_id.slice(0, 8)}…`);
         setTasks(previous => ({ ...previous, [data.task_id as string]: { ...previous[data.task_id as string], task_id: data.task_id as string, cancelRequested: true } }));
       } else if (data?.message) {
         if (data.task_id) {
           setTasks(previous => ({ ...previous, [data.task_id as string]: { ...previous[data.task_id as string], task_id: data.task_id as string, cancelRequested: false } }));
         }
+        addLog('error', `❌ [취소 오류] ${data.message}`);
         setMessages(previous => [...previous, { id: requestId(), role: 'system', text: data.message as string }]);
       }
     };
+    socket.on('nomi_command_received', onCommandReceived);
     socket.on('nomi_task_status', onTaskStatus);
     socket.on('nomi_response', onResponse);
     socket.on('nomi_bridge_status', onBridgeStatus);
     socket.on('nomi_model_status', onModelStatus);
     socket.on('nomi_model_switch_sent', onModelSwitchSent);
     socket.on('nomi_cancel_result', onCancelResult);
-    if (socket.connected) socket.emit('nomi_get_status');
+
+    const checkStatus = () => {
+      if (socket.connected) {
+        socket.emit('nomi_get_status');
+      }
+    };
+
+    socket.on('connect', checkStatus);
+    checkStatus();
+    const statusInterval = setInterval(checkStatus, 2500);
+
     return () => {
+      if (modelSwitchTimeoutRef.current) {
+        clearTimeout(modelSwitchTimeoutRef.current);
+        modelSwitchTimeoutRef.current = null;
+      }
+      clearInterval(statusInterval);
+      socket.off('connect', checkStatus);
+      socket.off('nomi_command_received', onCommandReceived);
       socket.off('nomi_task_status', onTaskStatus);
       socket.off('nomi_response', onResponse);
       socket.off('nomi_bridge_status', onBridgeStatus);
@@ -153,7 +249,7 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
       socket.off('nomi_model_switch_sent', onModelSwitchSent);
       socket.off('nomi_cancel_result', onCancelResult);
     };
-  }, [socket, activeModel]);
+  }, [socket]);
 
   useEffect(() => {
     const speech = recognitionRef.current;
@@ -164,6 +260,7 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
     const command = text.trim();
     if (!command || !socket?.connected || busyTask) return;
     const id = requestId();
+    addLog('info', `📤 [요청 전송] "${command}" (ID: ${id.slice(0, 8)}…)`);
     setMessages(previous => [...previous, { id: `${id}-user`, role: 'user', text: command, taskId: id }]);
     setTasks(previous => ({ ...previous, [id]: { task_id: id, submitting: true } }));
     socket.emit('nomi_command', { text: command, request_id: id, validate_only: validateOnly });
@@ -171,8 +268,13 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
   };
 
   const switchModel = () => {
-    if (!socket?.connected || !bridgeConnected || !selectedModel || modelSwitchPending) return;
+    if (!socket?.connected || !bridgeConnected || !selectedModel || (selectedModel === activeModel) || modelSwitchPending) return;
     setModelSwitchPending(true);
+    if (modelSwitchTimeoutRef.current) clearTimeout(modelSwitchTimeoutRef.current);
+    modelSwitchTimeoutRef.current = setTimeout(() => {
+      setModelSwitchPending(false);
+      addLog('warn', '⚠️ 모델 변경 응답 시간 초과 (다시 시도해주세요)');
+    }, 6000);
     socket.emit('nomi_model_switch', { profile: selectedModel, request_id: requestId() });
   };
 
@@ -218,22 +320,30 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
           <span className={`rounded-full px-2 py-1 text-xs ${socket?.connected ? 'bg-green-100 text-green-800' : 'bg-gray-200 text-gray-700'}`}>
             {socket?.connected ? '웹 서버 연결됨' : '웹 서버 연결 안 됨'}
           </span>
-          <span className={`rounded-full px-2 py-1 text-xs ${bridgeConnected ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
-            {bridgeConnected ? 'NOMI Agent 연결됨' : 'NOMI Agent 연결 안 됨'}
-          </span>
+          <div className="flex items-center gap-1">
+            <span className={`rounded-full px-2 py-1 text-xs ${bridgeConnected ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+              {bridgeConnected ? '🟢 NOMI Agent 연결됨' : '🟡 NOMI Agent 연결 확인 중'}
+            </span>
+            <button
+              onClick={() => { if (socket?.connected) socket.emit('nomi_get_status'); }}
+              title="Agent 브리지 연결 상태 즉시 새로고침"
+              className="rounded p-1 text-xs hover:bg-slate-200 dark:hover:bg-gray-700"
+            >
+              🔄
+            </button>
+          </div>
         </div>
       </div>
 
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <select value={selectedModel} onChange={event => setSelectedModel(event.target.value)} className="model-select min-w-0 flex-1 rounded-xl border px-3 py-2 text-sm text-gray-900" aria-label="NOMI 모델 선택">
-          <option value="">모델을 선택하세요</option>
+        <select value={selectedModel || activeModel} onChange={event => setSelectedModel(event.target.value)} className="model-select min-w-0 flex-1 rounded-xl border px-3 py-2 text-sm text-gray-900" aria-label="NOMI 모델 선택">
           {MODEL_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </select>
-        <button onClick={switchModel} disabled={!socket?.connected || !bridgeConnected || !selectedModel || modelSwitchPending} className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50">
+        <button onClick={switchModel} disabled={!socket?.connected || !bridgeConnected || !selectedModel || (selectedModel === activeModel) || modelSwitchPending} className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50">
           {modelSwitchPending ? '확인 중…' : '변경'}
         </button>
         <span className="w-full text-xs opacity-70 sm:w-auto sm:flex-1 sm:text-right">
-          활성 모델: {MODEL_OPTIONS.find(option => option.value === activeModel)?.label || 'Agent 확인 전'}
+          활성 모델: {MODEL_OPTIONS.find(option => option.value === activeModel)?.label || activeModel || 'qwen3.5:9b'}
         </span>
       </div>
 
@@ -248,6 +358,21 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
           </div>
         ))}
       </div>
+
+      {busyTask && (
+        <div className="mb-3 flex items-center justify-between rounded-xl border border-blue-200 bg-blue-50/80 px-3 py-2 text-xs font-medium text-blue-800 backdrop-blur-sm dark:border-blue-900/50 dark:bg-blue-950/40 dark:text-blue-300">
+          <span className="flex items-center gap-2">
+            <span className="relative flex h-2 w-2">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
+            </span>
+            <span>{busyTask.status ? STATUS_LABEL[busyTask.status] : '요청 전송 및 AI 처리 중…'}</span>
+          </span>
+          <span className="font-mono text-xs font-semibold text-blue-900 dark:text-blue-200">
+            ⏱️ 경과: {elapsedSec.toFixed(1)}s
+          </span>
+        </div>
+      )}
 
       {Object.values(tasks).slice(-4).map(task => {
         const status = task.status;
@@ -301,6 +426,39 @@ export function NomiPanel({ socket, theme }: { socket: Socket | null; theme: 'li
         검증 전용 · 도구 호출을 검증하고 실행하지 않음
       </label>
       {!bridgeConnected && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">NOMI Agent 브리지 연결이 확인되지 않아 AI 명령과 모델 변경을 사용할 수 없습니다.</p>}
+
+      <div className="mt-3 overflow-hidden rounded-xl border border-slate-200 dark:border-gray-700">
+        <div
+          onClick={() => setShowLogs(!showLogs)}
+          className="flex cursor-pointer select-none items-center justify-between bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-750"
+        >
+          <span className="flex items-center gap-1.5">
+            <span>📡 실시간 요청 전송 로그</span>
+            <span className="rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-bold text-blue-700 dark:bg-blue-900/50 dark:text-blue-300">
+              {logs.length}
+            </span>
+          </span>
+          <span className="text-[11px] font-normal opacity-70">
+            {showLogs ? '접기 ▲' : '펼치기 ▼'}
+          </span>
+        </div>
+        {showLogs && (
+          <div className="max-h-44 space-y-1 overflow-y-auto bg-slate-900 p-2.5 font-mono text-[11px] text-slate-200 shadow-inner">
+            {logs.map(log => (
+              <div key={log.id} className="flex items-start gap-1.5 leading-relaxed">
+                <span className="shrink-0 text-slate-500">[{log.time}]</span>
+                <span className={
+                  log.level === 'success' ? 'text-emerald-400' :
+                  log.level === 'error' ? 'text-rose-400' :
+                  log.level === 'warn' ? 'text-amber-400' :
+                  'text-blue-300'
+                }>{log.message}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       <p className="mt-2 text-[10px] opacity-60">작업 취소는 Harness 작업 취소 요청입니다. 긴급 정지는 조종 패널의 별도 정지 기능을 사용하세요.</p>
     </section>
   );

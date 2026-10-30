@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import type { CommandFeedback, RobotSimulationState, SocketStatus, SystemMessage } from '../types';
+import type { CommandFeedback, DockingStatus, RobotSimulationState, SocketStatus, SystemMessage } from '../types';
 import { ENV } from '../config/environment';
 import { KEY_TO_DIRECTION, MESSAGE_TYPES } from '../config/constants';
 
@@ -54,6 +54,17 @@ export const useSocket = (controlSpeed = ENV.DEFAULT_SPEED) => {
     angles: null
   });
   const [simulationState, setSimulationState] = useState<RobotSimulationState | null>(null);
+  const [dockingStatus, setDockingStatus] = useState<DockingStatus | null>(null);
+  const [armTaskComplete, setArmTaskComplete] = useState<{ status: string; task?: string } | null>(null);
+  const [wallAlignResult, setWallAlignResult] = useState<{
+    success: boolean;
+    x: number;
+    y: number;
+    yaw: number;
+    yaw_deg: number;
+    residual_cm: number;
+    message: string;
+  } | null>(null);
   const [commandFeedback, setCommandFeedback] = useState<CommandFeedback | null>(null);
   const [nomiNavigationRequest, setNomiNavigationRequest] = useState<NomiNavigationRequest | null>(null);
   const [nomiNavigationCancel, setNomiNavigationCancel] = useState<NomiNavigationCancel | null>(null);
@@ -188,7 +199,33 @@ export const useSocket = (controlSpeed = ENV.DEFAULT_SPEED) => {
     });
 
     newSocket.on('robot_state_snapshot', (data: { state?: RobotSimulationState }) => {
-      if (data?.state) setSimulationState(data.state);
+      if (data?.state) {
+        setSimulationState(data.state);
+        if (data.state.docking_status) {
+          setDockingStatus(data.state.docking_status);
+        }
+      }
+    });
+
+    newSocket.on('docking_status', (data: DockingStatus) => {
+      if (data) {
+        setDockingStatus(data);
+      }
+    });
+
+    newSocket.on('arm_task_complete', (data: { status: string; task?: string }) => {
+      if (data) {
+        setArmTaskComplete(data);
+      }
+    });
+
+    newSocket.on('wall_alignment_result', (data: any) => {
+      if (data) {
+        setWallAlignResult(data);
+        if (data.message) {
+          addMessage(data.message, data.success ? MESSAGE_TYPES.SUCCESS : MESSAGE_TYPES.WARNING);
+        }
+      }
     });
 
     newSocket.on('command_received', (data: { robot_state?: RobotSimulationState; sequence?: number; direction?: string; speed?: number; status?: string; transport_status?: string; message?: string }) => {
@@ -381,6 +418,26 @@ export const useSocket = (controlSpeed = ENV.DEFAULT_SPEED) => {
     }
   }, [socket, status.socket]);
 
+  const sendEnableDocking = useCallback((enabled: boolean) => {
+    if (!socket || status.socket !== 'connected') return;
+    socket.emit('enable_docking', { enabled: Boolean(enabled) });
+  }, [socket, status.socket]);
+
+  const sendDockingComplete = useCallback((payload?: Record<string, unknown>) => {
+    if (!socket || status.socket !== 'connected') return;
+    socket.emit('report_docking_complete', payload || { status: 'DOCKED' });
+  }, [socket, status.socket]);
+
+  const triggerMockArmTaskComplete = useCallback((taskName?: string) => {
+    if (!socket || status.socket !== 'connected') return;
+    socket.emit('mock_arm_task_complete', { status: 'SUCCEEDED', task: taskName || 'fold_towel' });
+  }, [socket, status.socket]);
+
+  const requestWallAlignment = useCallback((pose?: { x: number; y: number; yaw?: number; name?: string }) => {
+    if (!socket || status.socket !== 'connected') return;
+    socket.emit('request_wall_alignment', pose || {});
+  }, [socket, status.socket]);
+
   return {
     socket,
     status,
@@ -388,12 +445,19 @@ export const useSocket = (controlSpeed = ENV.DEFAULT_SPEED) => {
     sendPing,
     sendMoveCommand,
     sendDriveCommand,
+    sendEnableDocking,
     startVideoStream,
     stopVideoStream,
     telemetry,
     networkMetrics,
     armPositions,
     simulationState,
+    dockingStatus,
+    armTaskComplete,
+    sendDockingComplete,
+    triggerMockArmTaskComplete,
+    requestWallAlignment,
+    wallAlignResult,
     commandFeedback,
     nomiNavigationRequest,
     nomiNavigationCancel,

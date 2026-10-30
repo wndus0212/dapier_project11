@@ -105,7 +105,15 @@ def make_registry(**overrides):
         "location": FakeLocation(),
         "weather": FakeWeather(),
     }
-    return ToolRegistry(skills=skills), skills
+    reg = ToolRegistry(skills=skills)
+    reg.update_destinations([
+        {"name": "테이블 1", "aliases": ["1번 테이블", "1번테이블"], "x": -2.45, "y": -0.4, "kind": "table_approach"},
+        {"name": "테이블 2", "aliases": ["2번 테이블", "2번테이블"], "x": 0.0, "y": 1.5, "kind": "table_approach"},
+        {"name": "테이블 3", "aliases": ["3번 테이블", "3번테이블"], "x": 2.45, "y": -0.4, "kind": "table_approach"},
+        {"name": "책상", "aliases": ["A", "지점 A"], "x": -1.07, "y": -3.15, "kind": "station"},
+        {"name": "소파", "aliases": ["B", "지점 B"], "x": 2.20, "y": -1.75, "kind": "station"},
+    ])
+    return reg, skills
 
 
 class ToolRegistryTests(unittest.TestCase):

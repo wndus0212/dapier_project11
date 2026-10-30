@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 ENV_FILE = Path(os.environ.get("NOMI_AGENT_ENV", str(Path.home() / "ros2_ws/src/nomi_agent/.env"))).expanduser()
 try:
     from dotenv import load_dotenv
-    load_dotenv(ENV_FILE)
+    load_dotenv(ENV_FILE, override=True)
 except ImportError:
     # Keep the local Ollama profile usable on ROS system Python installs that
     # do not have python-dotenv; Ark still checks for its SDK when selected.
@@ -23,7 +23,7 @@ except ImportError:
             key, separator, value = line.partition("=")
             if separator and key.strip():
                 value = value.strip().strip('"').strip("'")
-                os.environ.setdefault(key.strip(), value)
+                os.environ[key.strip()] = value
 
 DOUBAO_MODEL = "doubao-seed-2-0-pro-260215"
 MODEL_PROFILES = {
@@ -54,7 +54,7 @@ class NativeChatResponse:
 
 
 def initial_profile():
-    profile = os.getenv("NOMI_MODEL_PROFILE", "qwen_hermes").strip()
+    profile = os.getenv("NOMI_MODEL_PROFILE", "qwen35_single").strip()
     if profile not in MODEL_PROFILES:
         raise ValueError(f"Unknown NOMI_MODEL_PROFILE: {profile}")
     return profile
@@ -81,13 +81,21 @@ class LLMProvider:
         self.provider = provider
         self.model = model
         try:
-            self.timeout_seconds = max(1.0, float(os.getenv("NOMI_LLM_TIMEOUT_SECONDS", "45")))
+            self.timeout_seconds = max(1.0, float(os.getenv("NOMI_LLM_TIMEOUT_SECONDS", "60")))
         except ValueError:
-            self.timeout_seconds = 45.0
+            self.timeout_seconds = 60.0
         if provider == "ollama":
             import ollama
-            host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-            self.client = ollama.Client(host=host, timeout=self.timeout_seconds)
+            host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
+            if not host or host.endswith(".") or "://" not in host:
+                host = "http://127.0.0.1:11434"
+            # Verify host accessibility; fallback to local if remote unreachable
+            try:
+                test_client = ollama.Client(host=host, timeout=min(2.0, self.timeout_seconds))
+                test_client.list()
+                self.client = ollama.Client(host=host, timeout=self.timeout_seconds)
+            except Exception:
+                self.client = ollama.Client(host="http://127.0.0.1:11434", timeout=self.timeout_seconds)
         elif provider == "ark":
             from openai import OpenAI
             api_key = os.getenv("ARK_API_KEY", "").strip()
@@ -102,6 +110,24 @@ class LLMProvider:
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
 
+    def verify_available(self):
+        if self.provider == "ollama":
+            try:
+                models_resp = self.client.list()
+                models = [m.get("model") or m.get("name") for m in models_resp.get("models", [])]
+                matched = any(self.model in (m or "") or (m or "").startswith(self.model) for m in models)
+                if not matched:
+                    installed = ", ".join(filter(None, models)) or "없음"
+                    raise ValueError(f"Ollama에 '{self.model}' 모델이 없습니다 (설치됨: {installed}). 터미널에서 'ollama pull {self.model}' 실행 필요")
+            except Exception as e:
+                if isinstance(e, ValueError):
+                    raise
+                raise RuntimeError(f"Ollama 연결 실패: {e}")
+        elif self.provider == "ark":
+            api_key = os.getenv("ARK_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError("Doubao(Ark) API 키(ARK_API_KEY)가 설정되지 않았습니다.")
+
     def chat(
         self,
         messages,
@@ -115,8 +141,8 @@ class LLMProvider:
             kwargs = {"model": self.model, "messages": messages}
             if json_mode:
                 kwargs["format"] = "json"
-            if think is not None:
-                kwargs["think"] = think
+            # Explicitly disable thinking (think=False) so Ollama Qwen models answer immediately without 40s internal soliloquy
+            kwargs["think"] = think if think is not None else False
             if keep_alive is not None:
                 kwargs["keep_alive"] = keep_alive
             if options is not None:

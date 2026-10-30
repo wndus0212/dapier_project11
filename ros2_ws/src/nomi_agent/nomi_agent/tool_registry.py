@@ -93,6 +93,9 @@ class ToolRegistry:
         "robot.state": "get_robot_state",
         "location.query": "get_user_location",
         "weather.query": "get_weather",
+        "towel.fold": "fold_towel",
+        "towel.status": "get_towel_fold_status",
+        "towel.stop": "stop_towel_fold",
     }
     ARGUMENT_ALIASES = {
         "navigate_to": {"destination": "location"},
@@ -125,6 +128,7 @@ class ToolRegistry:
         from nomi_agent.skills.state_skill import StateSkill
         from nomi_agent.skills.location_skill import LocationSkill
         from nomi_agent.skills.weather_skill import WeatherSkill
+        from nomi_agent.skills.towel_folding_skill import TowelFoldingSkill
 
         return {
             "navigation": NavigationSkill(node),
@@ -132,6 +136,7 @@ class ToolRegistry:
             "state": StateSkill(node),
             "location": LocationSkill(node),
             "weather": WeatherSkill(node),
+            "towel_folding": TowelFoldingSkill(node),
         }
 
     @staticmethod
@@ -158,14 +163,25 @@ class ToolRegistry:
                     or isinstance(x, bool) or not isinstance(x, (int, float))
                     or isinstance(y, bool) or not isinstance(y, (int, float))
                     or not math.isfinite(x) or not math.isfinite(y)
-                    or not -18 <= x <= 18 or not -4 <= y <= 24):
+                    or not -20 <= x <= 20 or not -20 <= y <= 24):
                 continue
             aliases = item.get("aliases", [])
             if not isinstance(aliases, list):
                 aliases = []
-            rows[name.strip()] = {"name": name.strip(), "x": float(x), "y": float(y),
-                                  "aliases": [a.strip() for a in aliases[:10] if isinstance(a, str) and a.strip()],
-                                  "kind": str(item.get("kind", "saved"))}
+            clean_name = name.strip()
+            new_aliases = [a.strip() for a in aliases[:10] if isinstance(a, str) and a.strip()]
+            if clean_name in rows:
+                existing_aliases = rows[clean_name].get("aliases", [])
+                merged = list(dict.fromkeys(existing_aliases + new_aliases))
+                rows[clean_name]["aliases"] = merged
+                rows[clean_name]["x"] = float(x)
+                rows[clean_name]["y"] = float(y)
+                if item.get("kind"):
+                    rows[clean_name]["kind"] = str(item.get("kind"))
+            else:
+                rows[clean_name] = {"name": clean_name, "x": float(x), "y": float(y),
+                                    "aliases": new_aliases,
+                                    "kind": str(item.get("kind", "saved"))}
         return rows
 
     def _destinations_callback(self, message) -> None:
@@ -217,7 +233,10 @@ class ToolRegistry:
         s = self.skills
 
         def call(skill: str, method: str, **fixed):
-            fn = getattr(s[skill], method)
+            inst = s.get(skill)
+            if inst is None or not hasattr(inst, method):
+                return lambda args: SkillResult.fail(f"{skill} 스킬이 설정되지 않았습니다.", {"error_code": "skill_not_found"})
+            fn = getattr(inst, method)
             return lambda args: fn(**({**fixed, **args}))
 
         specs = [
@@ -240,7 +259,18 @@ class ToolRegistry:
                      (), call("location", "get_user_location"), 7.0),
             ToolSpec("get_weather", "지정한 도시의 현재 날씨를 조회한다. 도시가 없으면 위치 조회 후 날씨를 확인한다.",
                      (ArgumentSpec("city", "날씨를 확인할 도시 이름", required=False, max_length=100),),
-                     lambda args: s["weather"].get_weather(args["city"]) if args.get("city") else SkillResult.fail("날씨를 확인할 도시가 필요합니다.", {"error_code": "missing_argument", "needs_clarification": True}), 12.0),
+                     lambda args: s["weather"].get_weather(args["city"]) if "weather" in s and args.get("city") else SkillResult.fail("날씨를 확인할 도시가 필요합니다.", {"error_code": "missing_argument", "needs_clarification": True}), 12.0),
+            ToolSpec("fold_towel", "학습된 정책으로 SO-101 양팔 로봇을 사용하여 수건을 반접기 및 대문접기한다. 자율주행 도착 후 실행하거나 승인 확인 후 호출한다.",
+                     (ArgumentSpec("confirm", "실행 승인 여부 (필수: true)", kind="boolean", required=True),
+                      ArgumentSpec("event_id", "도착 heartbeat 고유 event_id", kind="string", required=False),
+                      ArgumentSpec("profile", "정책 프로필 (original 또는 corrected)", kind="string", required=False, choices=("original", "corrected")),
+                      ArgumentSpec("duration_s", "최대 실행 시간(초, 기본 120)", kind="integer", required=False, minimum=30, maximum=300),
+                      ArgumentSpec("wait_s", "응답 대기 시간(초, 주행 후 호출 시 60 권장)", kind="integer", required=False, minimum=0, maximum=120)),
+                     call("towel_folding", "fold_towel"), 75.0, "robot_actuation", False),
+            ToolSpec("get_towel_fold_status", "수건 접기 작업의 진행 상태와 결과(verdict)를 조회한다.",
+                     (), call("towel_folding", "get_towel_fold_status"), 15.0, "read_only", False),
+            ToolSpec("stop_towel_fold", "수건 접기 작업을 긴급 중단한다.",
+                     (), call("towel_folding", "stop_towel_fold"), 15.0, "robot_actuation", False),
         ]
         return {spec.name: spec for spec in specs}
 
@@ -419,4 +449,18 @@ class ToolRegistry:
                 stop()
             except Exception as exc:
                 if self.node:
-                    self.node.get_logger().error(f"비상 정지 요청 실패: {exc}")
+                    try:
+                        self.node.get_logger().error(f"비상 정지 요청 실패: {exc}")
+                    except Exception:
+                        pass
+        towel = self.skills.get("towel_folding")
+        stop_towel = getattr(towel, "stop_towel_fold", None)
+        if callable(stop_towel):
+            try:
+                stop_towel()
+            except Exception as exc:
+                if self.node:
+                    try:
+                        self.node.get_logger().error(f"수건 접기 비상 정지 요청 실패: {exc}")
+                    except Exception:
+                        pass

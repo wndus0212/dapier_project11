@@ -5,6 +5,7 @@ import { GameSimulationCanvas } from './components/features/GameSimulationCanvas
 import { GameControlDeck } from './components/features/GameControlDeck';
 import { DestinationNavigator, type Destination } from './components/features/DestinationNavigator';
 import { NomiPanel } from './components/features/NomiPanel';
+import { TowelPlacementPanel } from './components/features/TowelPlacementPanel';
 import type { RobotSimulationState } from './types';
 import { findRoute, getDynamicObstaclePoints, isRouteBlockedByDynamicObstacle, type RoutePoint } from './utils/pathPlanner';
 import { INDOOR_MAP, NAVIGATION_DESTINATIONS } from './utils/indoorMap';
@@ -18,29 +19,86 @@ function readSavedHome(): Destination | null {
     if (saved) {
       const value = JSON.parse(saved) as Destination;
       if (Number.isFinite(value.x) && Number.isFinite(value.y)
-        && value.x >= -18 && value.x <= 18 && value.y >= -4 && value.y <= 24) {
-        return { name: '집', x: value.x, y: value.y };
+        && value.x >= INDOOR_MAP.bounds.minX && value.x <= INDOOR_MAP.bounds.maxX
+        && value.y >= INDOOR_MAP.bounds.minY && value.y <= INDOOR_MAP.bounds.maxY) {
+        return {
+          name: value.name || '홈 스테이션',
+          x: value.x,
+          y: value.y,
+          yaw: typeof value.yaw === 'number' && Number.isFinite(value.yaw) ? value.yaw : -17.1,
+          tag_id: typeof value.tag_id === 'number' ? value.tag_id : 1,
+          auto_dock: typeof value.auto_dock === 'boolean' ? value.auto_dock : true,
+        };
       }
     }
   } catch {
     // Use the built-in home waypoint when browser storage is unavailable.
   }
+  return { name: '홈 스테이션', x: INDOOR_MAP.start.x, y: INDOOR_MAP.start.y, yaw: -17.1, tag_id: 1, auto_dock: true };
+}
+
+const LAST_POSE_STORAGE_KEY = 'xlerobot.lastRobotPose';
+
+function readLastRobotPose(): { x: number; y: number; yaw: number } | null {
+  try {
+    const saved = localStorage.getItem(LAST_POSE_STORAGE_KEY);
+    if (saved) {
+      const p = JSON.parse(saved);
+      if (Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.yaw)) {
+        return { x: p.x, y: p.y, yaw: p.yaw };
+      }
+    }
+  } catch {}
   return null;
 }
 
+function saveLastRobotPose(p: { x: number; y: number; yaw: number }) {
+  try {
+    localStorage.setItem(LAST_POSE_STORAGE_KEY, JSON.stringify({
+      x: Number(p.x.toFixed(4)),
+      y: Number(p.y.toFixed(4)),
+      yaw: Number(p.yaw.toFixed(4)),
+    }));
+  } catch {}
+}
+
 function readSavedDestinations(): Destination[] {
+  const defaults: Destination[] = NAVIGATION_DESTINATIONS.map(d => ({
+    name: d.name,
+    x: d.x,
+    y: d.y,
+    yaw: typeof (d as any).yaw === 'number' ? (d as any).yaw : 0,
+    tag_id: typeof (d as any).tag_id === 'number' ? (d as any).tag_id : undefined,
+    auto_dock: typeof (d as any).auto_dock === 'boolean' ? (d as any).auto_dock : undefined,
+  }));
   try {
     const saved = localStorage.getItem('xlerobot.savedDestinations');
-    if (!saved) return [];
-    const values = JSON.parse(saved) as unknown;
-    if (!Array.isArray(values)) return [];
-    return values.filter((value): value is Destination => value && typeof value.name === 'string'
-      && value.name.trim().length > 0 && Number.isFinite(value.x) && Number.isFinite(value.y)
-      && value.x >= -18 && value.x <= 18 && value.y >= -4 && value.y <= 24)
-      .map(value => ({ name: value.name.trim(), x: value.x, y: value.y }));
+    if (saved) {
+      const values = JSON.parse(saved) as unknown;
+      if (Array.isArray(values) && values.length > 0) {
+        const parsed = values.filter((value): value is Destination => value && typeof value.name === 'string'
+          && value.name.trim().length > 0 && Number.isFinite(value.x) && Number.isFinite(value.y)
+          && value.x >= INDOOR_MAP.bounds.minX && value.x <= INDOOR_MAP.bounds.maxX
+          && value.y >= INDOOR_MAP.bounds.minY && value.y <= INDOOR_MAP.bounds.maxY)
+          .map(value => ({
+            name: value.name.trim(),
+            x: value.x,
+            y: value.y,
+            yaw: typeof value.yaw === 'number' && Number.isFinite(value.yaw) ? value.yaw : 0,
+            tag_id: typeof value.tag_id === 'number' ? value.tag_id : undefined,
+            auto_dock: typeof value.auto_dock === 'boolean' ? value.auto_dock : undefined,
+          }));
+        if (parsed.length > 0) {
+          const names = new Set(parsed.map(p => p.name));
+          const missingDefaults = defaults.filter(d => !names.has(d.name));
+          return [...missingDefaults, ...parsed];
+        }
+      }
+    }
   } catch {
-    return [];
+    // fallback to navigation destinations
   }
+  return defaults;
 }
 
 function numberText(value: number | undefined) {
@@ -124,13 +182,20 @@ export default function App() {
     sendPing,
     sendMoveCommand,
     sendDriveCommand,
+    sendEnableDocking,
+    sendDockingComplete,
+    triggerMockArmTaskComplete,
+    armTaskComplete,
     simulationState,
+    dockingStatus,
     commandFeedback,
     nomiNavigationRequest,
     nomiNavigationCancel,
     pressedKeys,
     stopContinuousMovement,
     sendNomiNavigationResult,
+    requestWallAlignment,
+    wallAlignResult,
   } = useSocket(speed);
 
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
@@ -138,13 +203,50 @@ export default function App() {
   const [joystick, setJoystick] = useState<StickVector>({ x: 0, y: 0 });
   const [controlDirection, setControlDirection] = useState<string | null>(null);
   const [resetToken, setResetToken] = useState(0);
-  const [localPose, setLocalPose] = useState({ x: 0, y: 0, yaw: 0 });
+  const [localPose, setLocalPose] = useState(() => {
+    const last = readLastRobotPose();
+    if (last) return last;
+    const home = readSavedHome();
+    return {
+      x: home?.x ?? INDOOR_MAP.start.x,
+      y: home?.y ?? INDOOR_MAP.start.y,
+      yaw: (((home?.yaw ?? -15.5) * Math.PI) / 180),
+    };
+  });
   const [homeWaypoint, setHomeWaypoint] = useState<Destination | null>(readSavedHome);
   const [savedDestinations, setSavedDestinations] = useState<Destination[]>(readSavedDestinations);
   const [destination, setDestination] = useState<Destination>(() => readSavedHome()
     ?? readSavedDestinations().find(place => place.name.normalize('NFKC').trim().toLocaleLowerCase() === '집')
     ?? { name: '', x: Number.NaN, y: Number.NaN });
-  const [navigationStatus, setNavigationStatus] = useState<'idle' | 'navigating' | 'arrived' | 'stopped' | 'blocked'>('idle');
+  const [navigationStatus, setNavigationStatus] = useState<'idle' | 'backing_up' | 'navigating' | 'docking' | 'docked' | 'arrived' | 'stopped' | 'blocked'>('idle');
+  const [preBackupEnabled, setPreBackupEnabled] = useState(() => {
+    try {
+      const saved = localStorage.getItem('xlerobot.preBackupEnabled');
+      return saved !== null ? saved === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+  const backupTimeoutRef = useRef<number | null>(null);
+  const backupIntervalRef = useRef<number | null>(null);
+  const clearBackupTimeout = () => {
+    if (backupTimeoutRef.current !== null) {
+      window.clearTimeout(backupTimeoutRef.current);
+      backupTimeoutRef.current = null;
+    }
+    if (backupIntervalRef.current !== null) {
+      window.clearInterval(backupIntervalRef.current);
+      backupIntervalRef.current = null;
+    }
+  };
+  const handleTogglePreBackup = (enabled: boolean) => {
+    setPreBackupEnabled(enabled);
+    try {
+      localStorage.setItem('xlerobot.preBackupEnabled', String(enabled));
+    } catch {
+      // ignore
+    }
+  };
   const [plannedRoute, setPlannedRoute] = useState<RoutePoint[]>([]);
   const [routeOrigin, setRouteOrigin] = useState<RoutePoint | null>(null);
   const [waypointIndex, setWaypointIndex] = useState(0);
@@ -178,7 +280,7 @@ export default function App() {
   ) => {
     const requestId = activeNomiNavigationRef.current;
     if (!requestId) return;
-    const verifiedArrival = status === 'SUCCEEDED' && pose && Number.isFinite(distance) && distance! <= 0.3;
+    const verifiedArrival = status === 'SUCCEEDED' && pose && Number.isFinite(distance) && distance! <= 0.35;
     const sent = sendNomiNavigationResult({
       request_id: requestId,
       status,
@@ -207,45 +309,42 @@ export default function App() {
     && simulationState?.nomi_mock_mode !== true;
   const hostStateAvailable = status.socket === 'connected'
     && simulationState?.host_connected === true
-    && Number.isFinite(stateAge) && (stateAge as number) <= 2.5
+    && (stateAge == null || (Number.isFinite(stateAge) && (stateAge as number) <= 5.0))
     && Number.isFinite(hostPosition?.x) && Number.isFinite(hostPosition?.y)
     && Number.isFinite(hostYaw);
   const hostPositionFresh = status.socket === 'connected'
     && simulationState?.host_connected === true
-    && Number.isFinite(stateAge) && (stateAge as number) <= 2.5
+    && (stateAge == null || (Number.isFinite(stateAge) && (stateAge as number) <= 5.0))
     && Number.isFinite(hostPosition?.x) && Number.isFinite(hostPosition?.y);
   const scanStatus = simulationState?.obstacle_scan_status;
   const rangeSensorAvailable = scanStatus?.healthy === true
     && Number.isFinite(scanStatus.age_ms) && (scanStatus.age_ms as number) <= 1200
     && Array.isArray(simulationState?.obstacle_scan);
-  const navigationAvailable = explicitMujocoMode && hostStateAvailable && rangeSensorAvailable;
+
+  // 실기체 AMR 연결 시 즉시 주행 허용, 미연결 시 로컬 시뮬레이션 지원
+  const isRealAMR = hostStateAvailable && (simulationState?.host_connected === true);
+  const isLocalSim = !hostStateAvailable;
+  const navigationAvailable = isRealAMR
+    ? (status.socket === 'connected')
+    : isLocalSim
+      ? (status.socket === 'connected')
+      : (explicitMujocoMode && rangeSensorAvailable);
+
   let navigationUnavailableReason: string | null = null;
   if (status.socket !== 'connected') {
     navigationUnavailableReason = '웹 서버와 연결되지 않았습니다.';
-  } else if (simulationState?.nomi_mock_mode === true) {
-    navigationUnavailableReason = 'Mock Agent 모드는 MuJoCo와 실제 로봇 주행을 차단합니다.';
-  } else if (!simulationState) {
-    navigationUnavailableReason = 'MuJoCo 상태 데이터가 아직 도착하지 않았습니다.';
-  } else if (simulationState.robot_type !== 'mujoco') {
-    navigationUnavailableReason = '목적지 주행은 명시적으로 MuJoCo 모드가 확인된 경우에만 허용됩니다.';
-  } else if (simulationState.host_connected !== true) {
-    navigationUnavailableReason = 'MuJoCo 호스트가 연결되지 않았습니다. MuJoCo 호스트를 실행하고 연결을 확인하세요.';
-  } else if (simulationState.navigation_execution_enabled !== true) {
-    navigationUnavailableReason = 'MuJoCo 목적지 주행이 비활성화되어 있습니다. NOMI_MUJOCO_NAV_ENABLED=1 설정이 필요합니다.';
-  } else if (!Number.isFinite(stateAge)) {
-    navigationUnavailableReason = 'MuJoCo 위치 데이터가 아직 도착하지 않았습니다.';
-  } else if ((stateAge as number) > 2.5) {
-    navigationUnavailableReason = `MuJoCo 위치 데이터가 오래됐습니다 (${(stateAge as number).toFixed(1)}초).`;
-  } else if (!Number.isFinite(hostPosition?.x) || !Number.isFinite(hostPosition?.y) || !Number.isFinite(hostYaw)) {
-    navigationUnavailableReason = 'MuJoCo 위치 또는 방향 데이터가 불완전합니다.';
-  } else if (!scanStatus) {
-    navigationUnavailableReason = '거리 센서 스캔 데이터가 아직 없습니다.';
-  } else if (scanStatus.healthy !== true) {
-    navigationUnavailableReason = `거리 센서 상태가 비정상입니다${scanStatus.error ? `: ${scanStatus.error}` : scanStatus.status ? ` (${scanStatus.status})` : ''}.`;
-  } else if (!Number.isFinite(scanStatus.age_ms) || (scanStatus.age_ms as number) > 1200) {
-    navigationUnavailableReason = `거리 센서 데이터가 오래됐습니다${Number.isFinite(scanStatus.age_ms) ? ` (${Math.round(scanStatus.age_ms as number)}ms)` : ''}.`;
-  } else if (!Array.isArray(simulationState.obstacle_scan)) {
-    navigationUnavailableReason = '거리 센서 측정값 형식이 올바르지 않습니다.';
+  } else if (!isRealAMR && !isLocalSim) {
+    if (simulationState?.nomi_mock_mode === true) {
+      navigationUnavailableReason = 'Mock Agent 모드는 실제 로봇 주행을 차단합니다.';
+    } else if (simulationState?.robot_type !== 'mujoco' && simulationState?.robot_type !== 'amr') {
+      navigationUnavailableReason = '목적지 주행은 AMR 또는 시뮬레이션 모드가 확인된 경우에만 허용됩니다.';
+    } else if (simulationState?.navigation_execution_enabled !== true) {
+      navigationUnavailableReason = '목적지 주행이 비활성화되어 있습니다.';
+    } else if (!scanStatus || scanStatus.healthy !== true) {
+      navigationUnavailableReason = `거리 센서 상태가 비정상입니다${scanStatus?.error ? `: ${scanStatus.error}` : ''}.`;
+    } else if (!Number.isFinite(scanStatus.age_ms) || (scanStatus.age_ms as number) > 1200) {
+      navigationUnavailableReason = '거리 센서 데이터가 오래됐습니다.';
+    }
   }
   const navigationPose = hostStateAvailable
     ? { x: hostPosition!.x!, y: hostPosition!.y!, yaw: hostYaw! }
@@ -263,10 +362,24 @@ export default function App() {
 
   useEffect(() => {
     if (!socket || status.socket !== 'connected') return;
+    const baseNames = new Set(NAVIGATION_DESTINATIONS.map(d => d.name));
+    const extraSaved = savedDestinations
+      .filter(s => !baseNames.has(s.name))
+      .map(({ name, x, y, yaw }) => ({ name, aliases: [], x, y, yaw: yaw ?? 0, kind: 'saved' }));
+    const homeEntry = homeWaypoint
+      ? [{
+          name: homeWaypoint.name,
+          aliases: ['홈', '홈스테이션', '집', '원점', '충전소', '충전 위치', 'home'],
+          x: homeWaypoint.x,
+          y: homeWaypoint.y,
+          yaw: homeWaypoint.yaw ?? -15.5,
+          kind: 'home',
+        }]
+      : [];
     const destinations = [
       ...NAVIGATION_DESTINATIONS,
-      ...savedDestinations.map(({ name, x, y }) => ({ name, aliases: [], x, y, kind: 'saved' })),
-      ...(homeWaypoint ? [{ name: '집', aliases: ['home'], x: homeWaypoint.x, y: homeWaypoint.y, kind: 'home' }] : []),
+      ...extraSaved,
+      ...homeEntry,
     ];
     socket.emit('nomi_destinations_sync', { destinations });
   }, [socket, status.socket, savedDestinations, homeWaypoint]);
@@ -274,7 +387,9 @@ export default function App() {
   const editDestination = (target: Destination) => {
     setDestination(target);
     setNavigationNotice(null);
-    if (navigationStatus === 'navigating') {
+    clearBackupTimeout();
+    if (navigationStatus === 'navigating' || navigationStatus === 'backing_up' || navigationStatus === 'docking') {
+      sendEnableDocking(false);
       reportNomiNavigationResult('CANCELLED', '목적지가 바뀌어 이전 자동 주행을 취소했습니다.');
       setNavigationStatus('stopped');
       setControlDirection(null);
@@ -285,11 +400,33 @@ export default function App() {
 
   const beginNavigation = (target: Destination) => {
     logNavigation('begin_requested', { target: { name: target.name, x: target.x, y: target.y } });
+    clearBackupTimeout();
+    sendEnableDocking(false);
     if (!navigationAvailable) {
       setNavigationNotice(navigationUnavailableReason ?? '주행에 필요한 상태를 확인할 수 없습니다.');
       setNavigationStatus('stopped');
       sendMoveCommand('stop', 0);
       reportNomiNavigationResult('FAILED', navigationUnavailableReason ?? '주행에 필요한 상태를 확인할 수 없습니다.');
+      return;
+    }
+    const initialDistance = Math.hypot(target.x - navigationPose.x, target.y - navigationPose.y);
+    const normName = (target.name || '').normalize('NFKC').trim().toLocaleLowerCase();
+    const shouldDock = (
+      Boolean((target as any).kind === 'charging' || (target as any).tag_id) ||
+      ['집', 'home', '홈', '홈스테이션', '충전소', '충전위치', '충전도크', '충전장소', '도킹스테이션', '충전기', 'dock', 'chargingstation'].includes(normName)
+    );
+
+    if (initialDistance <= 0.35) {
+      if (shouldDock) {
+        setDestination(target);
+        setNavigationStatus('docking');
+        sendEnableDocking(true);
+        setNavigationNotice(`🎯 ${target.name || '목적지'} 부근입니다: AprilTag 정밀 도킹을 가동합니다...`);
+        return;
+      }
+      setNavigationStatus('arrived');
+      setNavigationNotice(`이미 목적지 '${target.name}' 근처(${initialDistance.toFixed(2)}m)에 위치해 있습니다.`);
+      reportNomiNavigationResult('SUCCEEDED', `이미 목적지 '${target.name}'에 위치해 있습니다.`, navigationPose, initialDistance);
       return;
     }
     const route = findRoute(navigationPose, target, obstacleScanRef.current);
@@ -311,9 +448,55 @@ export default function App() {
     turnDirectionRef.current = null;
     motionGuardRef.current.reset();
     lastControllerPhaseRef.current = null;
-    setNavigationNotice(null);
-    setNavigationStatus('navigating');
-    logNavigation('route_planned', { target: target.name, waypoint_count: route.length, route });
+
+    // 출발 전 안전 후진(언도킹)은 로봇이 충전소나 정거장 도크(40cm 이내)에 실제로 있을 때만 수행
+    // 이미 통로/중간 위치(-0.03, -2.09 등)에 있는 경우에는 후진 없이 목적지로 즉시 최단거리 전진
+    const isAtDock = savedDestinations.some(d => {
+      const dist = Math.hypot(d.x - navigationPose.x, d.y - navigationPose.y);
+      return dist <= 0.40;
+    }) || (homeWaypoint ? Math.hypot(homeWaypoint.x - navigationPose.x, homeWaypoint.y - navigationPose.y) <= 0.40 : false);
+
+    const shouldPreBackup = preBackupEnabled && isAtDock;
+
+    if (shouldPreBackup) {
+      setNavigationStatus('backing_up');
+      setNavigationNotice('🔙 [출발 전 안전 후진] 언도킹 안전 공간을 확보하기 위해 후진 중...');
+      setControlDirection('backward');
+
+      const backupSpeed = 0.7; // ~0.175 m/s (adequate speed to overcome robot friction)
+      sendMoveCommand('backward', backupSpeed);
+
+      if (backupIntervalRef.current !== null) {
+        window.clearInterval(backupIntervalRef.current);
+      }
+      // Stream backward velocity every 100ms so robot hardware watchdog does not stop motors
+      backupIntervalRef.current = window.setInterval(() => {
+        sendMoveCommand('backward', backupSpeed);
+      }, 100);
+
+      backupTimeoutRef.current = window.setTimeout(() => {
+        if (backupIntervalRef.current !== null) {
+          window.clearInterval(backupIntervalRef.current);
+          backupIntervalRef.current = null;
+        }
+        sendMoveCommand('stop', 0);
+        setControlDirection(null);
+        backupTimeoutRef.current = window.setTimeout(() => {
+          const currentPostBackupPose = navigationPoseRef.current;
+          const updatedRoute = findRoute(currentPostBackupPose, target, obstacleScanRef.current) ?? route;
+          setPlannedRoute(updatedRoute);
+          setRouteOrigin({ x: currentPostBackupPose.x, y: currentPostBackupPose.y });
+          setWaypointIndex(0);
+          setNavigationNotice(null);
+          setNavigationStatus('navigating');
+          logNavigation('route_planned', { target: target.name, waypoint_count: updatedRoute.length, route: updatedRoute });
+        }, 400);
+      }, 1500);
+    } else {
+      setNavigationNotice(null);
+      setNavigationStatus('navigating');
+      logNavigation('route_planned', { target: target.name, waypoint_count: route.length, route });
+    }
   };
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -328,15 +511,21 @@ export default function App() {
     const normalizePlaceName = (name: string) => name.normalize('NFKC').replace(/[\s_-]+/g, '').toLocaleLowerCase();
     const requestedName = normalizePlaceName(nomiNavigationRequest.name || nomiNavigationRequest.destination);
     const genericSavedName = ['저장된목적지', '저장된장소', '목적지', 'saved', 'saveddestination'].includes(requestedName);
-    const homeRequested = nomiNavigationRequest.destination === 'home' || ['집', 'home'].includes(requestedName);
+    const homeNames = new Set(['집', 'home', '홈', '홈스테이션', '충전소', '충전위치', '충전도크', '원점', 'chargingstation', 'dock']);
+    const homeRequested = nomiNavigationRequest.destination === 'home' || homeNames.has(requestedName);
     const chargingNames = new Set(['충전위치', '충전도크', '충전소', '충전장소', '도킹스테이션', '충전기', 'dock', 'chargingstation']);
-    const savedHome = savedDestinations.find(place => normalizePlaceName(place.name) === '집');
-    const target = homeRequested
-      ? homeWaypoint ?? savedHome
-      : genericSavedName
-        ? savedDestinations.length === 1 ? savedDestinations[0] : undefined
-        : savedDestinations.find(place => normalizePlaceName(place.name) === requestedName
-          || (chargingNames.has(requestedName) && chargingNames.has(normalizePlaceName(place.name))));
+
+    let target: Destination | undefined;
+    if (homeRequested || homeNames.has(requestedName)) {
+      target = homeWaypoint
+        ?? savedDestinations.find(p => homeNames.has(normalizePlaceName(p.name)))
+        ?? NAVIGATION_DESTINATIONS.find(p => homeNames.has(normalizePlaceName(p.name)));
+    } else if (genericSavedName) {
+      target = savedDestinations.length === 1 ? savedDestinations[0] : undefined;
+    } else {
+      target = savedDestinations.find(place => normalizePlaceName(place.name) === requestedName || (chargingNames.has(requestedName) && chargingNames.has(normalizePlaceName(place.name))))
+        ?? NAVIGATION_DESTINATIONS.find(place => normalizePlaceName(place.name) === requestedName || (chargingNames.has(requestedName) && chargingNames.has(normalizePlaceName(place.name))));
+    }
     if (!target) {
       setNavigationStatus('stopped');
       reportNomiNavigationResult('FAILED', '저장된 목적지를 찾지 못해 주행을 시작하지 않았습니다.');
@@ -360,19 +549,22 @@ export default function App() {
 
   useEffect(() => {
     if (!nomiNavigationCancel || activeNomiNavigationRef.current !== nomiNavigationCancel.request_id) return;
+    sendEnableDocking(false);
     reportNomiNavigationResult('CANCELLED', 'NOMI에서 자동 주행 취소를 요청했습니다.');
     setNavigationStatus('stopped');
     setControlDirection(null);
     clearPlannedRoute('nomi_task_cancelled');
     sendMoveCommand('stop', 0);
-  }, [nomiNavigationCancel, sendMoveCommand]);
+  }, [nomiNavigationCancel, sendEnableDocking, sendMoveCommand]);
 
   useEffect(() => {
-    if (pressedKeys.size > 0 && plannedRoute.length > 0) {
+    if (pressedKeys.size > 0 && (plannedRoute.length > 0 || navigationStatus === 'docking')) {
+      sendEnableDocking(false);
       reportNomiNavigationResult('CANCELLED', '수동 키 입력으로 자동 주행을 취소했습니다.');
       clearPlannedRoute('manual_keyboard_input');
+      setNavigationStatus('stopped');
     }
-  }, [pressedKeys.size]);
+  }, [pressedKeys.size, navigationStatus, sendEnableDocking]);
 
   useEffect(() => {
     if (navigationStatus !== 'navigating') return;
@@ -416,21 +608,32 @@ export default function App() {
       const now = performance.now();
       const liveState = simulationStateRef.current;
       const liveScanStatus = liveState?.obstacle_scan_status;
-      const liveStateValid = liveState?.host_connected === true
-        && Number.isFinite(liveState.state_age) && (liveState.state_age as number) <= 2.5
-        && Number.isFinite(liveState.position?.x) && Number.isFinite(liveState.position?.y)
-        && Number.isFinite(liveState.rotation?.yaw)
-        && liveScanStatus?.healthy === true
-        && Number.isFinite(liveScanStatus.age_ms) && (liveScanStatus.age_ms as number) <= 1200
-        && Array.isArray(liveState.obstacle_scan);
-      if (!liveStateValid) {
-        setControlDirection(null);
-        setNavigationStatus('stopped');
-        setNavigationNotice('MuJoCo 위치 또는 센서 데이터가 오래되었거나 유효하지 않아 자동 주행을 안전 정지했습니다.');
-        clearPlannedRoute('live_pose_or_sensor_stale');
-        sendMoveCommand('stop', 0);
-        reportNomiNavigationResult('FAILED', '최신 위치·방향 또는 센서 상태를 확인하지 못해 안전 정지했습니다.');
-        return;
+      if (hostStateAvailable) {
+        const liveStateValid = liveState?.host_connected === true
+          && Number.isFinite(liveState.state_age) && (liveState.state_age as number) <= 2.5
+          && Number.isFinite(liveState.position?.x) && Number.isFinite(liveState.position?.y)
+          && Number.isFinite(liveState.rotation?.yaw)
+          && liveScanStatus?.healthy === true
+          && Number.isFinite(liveScanStatus.age_ms) && (liveScanStatus.age_ms as number) <= 1200
+          && Array.isArray(liveState.obstacle_scan);
+        if (!liveStateValid) {
+          setControlDirection(null);
+          setNavigationStatus('stopped');
+          setNavigationNotice('MuJoCo 위치 또는 센서 데이터가 오래되었거나 유효하지 않아 자동 주행을 안전 정지했습니다.');
+          clearPlannedRoute('live_pose_or_sensor_stale');
+          sendMoveCommand('stop', 0);
+          reportNomiNavigationResult('FAILED', '최신 위치·방향 또는 센서 상태를 확인하지 못해 안전 정지했습니다.');
+          return;
+        }
+        if (!rangeSensorAvailable) {
+          setControlDirection(null);
+          setNavigationStatus('stopped');
+          setNavigationNotice('MuJoCo 거리 센서 갱신이 중단되어 자동 주행을 안전 정지했습니다.');
+          clearPlannedRoute('sensor_unhealthy_or_stale');
+          sendMoveCommand('stop', 0);
+          reportNomiNavigationResult('FAILED', 'MuJoCo 거리 센서 갱신이 끊겨 안전 정지했습니다.');
+          return;
+        }
       }
       const desiredYaw = Math.atan2(dy, dx);
       const headingError = Math.abs(Math.atan2(
@@ -439,17 +642,8 @@ export default function App() {
       ));
       const measuredYawRate = simulationStateRef.current?.velocity?.angular?.z ?? 0;
       const actualYawRate = Math.abs(measuredYawRate);
-      const liveObstacles = rangeSensorAvailable ? obstacleScanRef.current : [];
+      const liveObstacles = (hostStateAvailable && rangeSensorAvailable) ? obstacleScanRef.current : [];
       const routeBlocked = isRouteBlockedByDynamicObstacle(pose, plannedRoute, waypointIndex, liveObstacles);
-      if (!rangeSensorAvailable) {
-        setControlDirection(null);
-        setNavigationStatus('stopped');
-        setNavigationNotice('MuJoCo 거리 센서 갱신이 중단되어 자동 주행을 안전 정지했습니다.');
-        clearPlannedRoute('sensor_unhealthy_or_stale');
-        sendMoveCommand('stop', 0);
-        reportNomiNavigationResult('FAILED', 'MuJoCo 거리 센서 갱신이 끊겨 안전 정지했습니다.');
-        return;
-      }
       if (routeBlocked && now - lastDynamicReplanRef.current > 900) {
         lastDynamicReplanRef.current = now;
         const reroute = findRoute(pose, destination, liveObstacles);
@@ -514,32 +708,64 @@ export default function App() {
         ? Math.abs(segmentX * (pose.y - segmentStart.y) - segmentY * (pose.x - segmentStart.x)) / segmentLength
         : Number.POSITIVE_INFINITY;
       const isFinalWaypoint = waypointIndex >= plannedRoute.length - 1;
-      const passCaptureDistance = isFinalWaypoint ? 0.3 : 0.5;
+      const passCaptureDistance = isFinalWaypoint ? 0.3 : 0.45;
       const passedWaypoint = alongSegment >= 1
         && distance <= passCaptureDistance
         && crossTrack <= 0.35;
       const waypointPositionReached = distance <= 0.3 || (!isFinalWaypoint && passedWaypoint);
-      if (waypointPositionReached && actualYawRate <= 0.05) {
-        setControlDirection(null);
-        sendMoveCommand('stop', 0);
-        if (waypointIndex < plannedRoute.length - 1) {
+      if (waypointPositionReached) {
+        if (!isFinalWaypoint) {
+          // Seamlessly advance to the next route waypoint without stopping or jerking
           turnDirectionRef.current = null;
-          motionGuardRef.current.reset();
           lastControllerPhaseRef.current = null;
+          motionGuardRef.current.reset();
           setWaypointIndex(index => index + 1);
-        } else {
+          return;
+        }
+
+        // Only at the final destination do we settle and align heading
+        if (actualYawRate <= 0.08) {
+          // Final waypoint reached: check final heading alignment if destination.yaw is specified
+          if (typeof destination.yaw === 'number' && Number.isFinite(destination.yaw)) {
+            const targetYawRad = (destination.yaw * Math.PI) / 180;
+            const headingErr = Math.atan2(Math.sin(targetYawRad - pose.yaw), Math.cos(targetYawRad - pose.yaw));
+            if (Math.abs(headingErr) > 0.15) {
+              const rotDir = headingErr > 0 ? 'rotate_left' : 'rotate_right';
+              setControlDirection(rotDir);
+              const rotSpeed = Math.max(0.18, Math.min(0.35, Math.abs(headingErr) * 0.7));
+              sendMoveCommand(rotDir, rotSpeed);
+              return;
+            }
+          }
+
+          setControlDirection(null);
+          sendMoveCommand('stop', 0);
           const actualPose = navigationPoseRef.current;
           const arrivalDistance = Math.hypot(destination.x - actualPose.x, destination.y - actualPose.y);
-          if (navigationAvailable && arrivalDistance <= 0.3) {
+          if (navigationAvailable && arrivalDistance <= 0.35) {
+            const normName = (destination.name || '').replace(/[\s_-]+/g, '').toLowerCase();
+            const shouldDock = Boolean(
+              destination.auto_dock ||
+              (destination.tag_id !== undefined && destination.tag_id !== null) ||
+              ['집', 'home', '홈', '홈스테이션', '충전소', '충전위치', '충전도크', '충전장소', '도킹스테이션', '충전기', 'dock', 'chargingstation'].includes(normName)
+            );
+
+            if (shouldDock) {
+              setNavigationStatus('docking');
+              sendEnableDocking(true);
+              setNavigationNotice(`🎯 ${destination.name || '목적지'} 정렬 완료: AprilTag 정밀 도킹을 시작합니다...`);
+              return;
+            }
+
             setNavigationStatus('arrived');
-            reportNomiNavigationResult('SUCCEEDED', `${destination.name || '목적지'}에 도착했습니다.`, actualPose, arrivalDistance);
+            reportNomiNavigationResult('SUCCEEDED', `${destination.name || '목적지'}에 도착했습니다. (방향 정렬 완료)`, actualPose, arrivalDistance);
           } else {
             setNavigationStatus('blocked');
             setNavigationNotice('목적지 도착을 위치 데이터로 확인하지 못해 완료 처리하지 않았습니다.');
             reportNomiNavigationResult('FAILED', '현재 위치가 목적지 0.3m 이내라는 도착 확인이 없습니다.', actualPose, arrivalDistance);
           }
+          return;
         }
-        return;
       }
 
       const command = computeWaypointCommand(
@@ -548,6 +774,7 @@ export default function App() {
         speed,
         turnDirectionRef.current,
         measuredYawRate,
+        isFinalWaypoint,
       );
       turnDirectionRef.current = command.turnDirection;
       if (command.phase !== lastControllerPhaseRef.current) {
@@ -574,7 +801,7 @@ export default function App() {
         actualAngular,
         damping: command.damping,
       });
-      if (motionFault) {
+      if (hostStateAvailable && motionFault) {
         logNavigation('motion_guard_fault', {
           reason: motionFault,
           phase: command.phase,
@@ -599,10 +826,62 @@ export default function App() {
       window.clearInterval(timer);
       logNavigation('route_follower_stopped', { waypoint_index: waypointIndex, waypoint_count: plannedRoute.length });
     };
-  }, [destination, hostStateAvailable, navigationAvailable, navigationUnavailableReason, navigationStatus, plannedRoute, pressedKeys.size, rangeSensorAvailable, routeOrigin, sendDriveCommand, sendMoveCommand, speed, waypointIndex]);
+  }, [destination, hostStateAvailable, navigationAvailable, navigationUnavailableReason, navigationStatus, plannedRoute, pressedKeys.size, rangeSensorAvailable, routeOrigin, sendDriveCommand, sendEnableDocking, sendMoveCommand, speed, waypointIndex]);
+
+  // Monitor precision docking completion / timeout
+  useEffect(() => {
+    if (navigationStatus !== 'docking') return;
+
+    if (dockingStatus?.state === 'DOCKED') {
+      sendEnableDocking(false);
+      setNavigationStatus('docked');
+      setNavigationNotice('🎉 AprilTag 정밀 도킹 완료: 로봇암 작업 대기 중 (/amr/docking_complete 발행)...');
+      sendDockingComplete({ destination: destination.name, tag_id: destination.tag_id, status: 'DOCKED' });
+      const actualPose = navigationPoseRef.current;
+      const arrivalDistance = Math.hypot(destination.x - actualPose.x, destination.y - actualPose.y);
+      reportNomiNavigationResult('SUCCEEDED', `${destination.name || '목적지'} AprilTag 정밀 도킹에 성공했습니다.`, actualPose, arrivalDistance);
+      return;
+    }
+
+    // Safety timeout for visual docking (35 seconds)
+    const timeout = setTimeout(() => {
+      if (navigationStatus === 'docking') {
+        sendEnableDocking(false);
+        setNavigationStatus('blocked');
+        setNavigationNotice('⚠️ AprilTag 도킹 제한 시간 초과: 마커 안착이 완료되지 못했습니다.');
+        const actualPose = navigationPoseRef.current;
+        const arrivalDistance = Math.hypot(destination.x - actualPose.x, destination.y - actualPose.y);
+        reportNomiNavigationResult('FAILED', `${destination.name || '목적지'} AprilTag 비전 도킹 시간 초과 (미안착)`, actualPose, arrivalDistance);
+      }
+    }, 35000);
+
+    return () => clearTimeout(timeout);
+  }, [navigationStatus, dockingStatus?.state, sendEnableDocking, sendDockingComplete, destination, reportNomiNavigationResult]);
+
+  useEffect(() => {
+    if (wallAlignResult?.success) {
+      setLocalPose({ x: wallAlignResult.x, y: wallAlignResult.y, yaw: wallAlignResult.yaw });
+      setNavigationNotice(`🎯 벽면 스캔 매칭 완료: 오차 ${wallAlignResult.residual_cm.toFixed(1)}cm (${wallAlignResult.x.toFixed(2)}, ${wallAlignResult.y.toFixed(2)})`);
+    } else if (wallAlignResult && !wallAlignResult.success) {
+      setNavigationNotice(`⚠️ 벽면 스캔 매칭: ${wallAlignResult.message}`);
+    }
+  }, [wallAlignResult]);
+
+  // Monitor external robot arm (secondary laptop) task completion -> auto undock & return home
+  useEffect(() => {
+    if (!armTaskComplete || navigationStatus !== 'docked') return;
+    setNavigationNotice('🤖 [로봇암 작업 완료 수신] 수건 개기가 완료되었습니다! 안전 후진(언도킹) 후 홈 스테이션으로 복귀합니다...');
+    if (homeWaypoint && destination.name !== homeWaypoint.name) {
+      const timer = window.setTimeout(() => {
+        beginNavigation(homeWaypoint);
+      }, 1200);
+      return () => window.clearTimeout(timer);
+    }
+  }, [armTaskComplete, navigationStatus, homeWaypoint, destination.name]);
 
   useEffect(() => {
     if (commandFeedback?.direction !== 'drive_vector') return;
+    if (isLocalSim) return;
     if (navigationStatus !== 'navigating') {
       lastHandledDriveFeedbackSequenceRef.current = Math.max(
         lastHandledDriveFeedbackSequenceRef.current,
@@ -657,46 +936,43 @@ export default function App() {
       return;
     }
 
-    // Navigation-style steering: turn toward joystick direction, then drive forward.
-    // Joystick coordinate: x = right(+)/left(-), y = down(+)/up(-) (screen space)
-    // MuJoCo yaw: +X = 0, counter-clockwise positive
-    // Joystick up (y<0) = forward = current heading, so desired yaw offset from heading:
-    //   joystick angle in screen coords: atan2(-vector.y, vector.x)  (negate y for math coords)
-    const joystickAngle = Math.atan2(-vector.y, vector.x);
-    // Combine with robot's current heading to get desired world yaw
-    const currentYaw = simulationState?.rotation?.yaw ?? localPose.yaw;
-    // joystickAngle is relative: up(π/2)=forward, right(0)=right turn, left(π)=left turn
-    // Convert to world frame: desired yaw = currentYaw + (joystickAngle - π/2)
-    // But for navigation-style, we want: joystick direction = desired world heading
-    // joystick up = "keep current heading and drive forward"
-    // joystick right = "turn right (decrease yaw) and drive forward"
-    const desiredYaw = currentYaw + (joystickAngle - Math.PI / 2);
-    const yawError = Math.atan2(
-      Math.sin(desiredYaw - currentYaw),
-      Math.cos(desiredYaw - currentYaw),
-    );
+    // Joystick coordinate:
+    // vector.x: -1 (left) ~ +1 (right)
+    // vector.y: -1 (up / 전진) ~ +1 (down / 후진)
+    const linY = -vector.y; // > 0: forward, < 0: backward
+    const angX = -vector.x; // > 0: left (CCW), < 0: right (CW)
 
-    const absYawError = Math.abs(yawError);
-    // Proportional angular steering
-    const angularSpeed = Math.max(-0.7, Math.min(0.7, yawError * 1.8));
-    // Reduce forward speed when turning sharply (cos-based scaling)
-    const alignmentFactor = Math.max(0, Math.cos(yawError));
-    const driveSpeed = speed * magnitude * alignmentFactor;
+    let direction: string;
+    let driveSpeed: number;
+    let angularSpeed = 0;
 
-    // Use body-relative forward + angular: drive forward while steering
-    const displayDirection = absYawError > 0.3
-      ? (yawError > 0 ? 'rotate_left' : 'rotate_right')
-      : 'forward';
-    setControlDirection(displayDirection);
+    if (linY > 0.1) {
+      direction = 'forward';
+      driveSpeed = Math.min(1, Math.abs(linY)) * speed;
+      angularSpeed = Math.max(-0.7, Math.min(0.7, angX * 0.7));
+      setControlDirection('forward');
+    } else if (linY < -0.1) {
+      direction = 'backward';
+      driveSpeed = Math.min(1, Math.abs(linY)) * speed;
+      angularSpeed = Math.max(-0.7, Math.min(0.7, angX * 0.7));
+      setControlDirection('backward');
+    } else {
+      direction = angX > 0 ? 'rotate_left' : 'rotate_right';
+      driveSpeed = Math.min(1, Math.abs(angX)) * speed;
+      angularSpeed = angX > 0 ? 0.7 : -0.7;
+      setControlDirection(direction);
+    }
 
     const now = performance.now();
     if (now - lastJoystickCommandRef.current >= 60) {
       lastJoystickCommandRef.current = now;
-      sendMoveCommand('forward', driveSpeed, angularSpeed);
+      sendMoveCommand(direction, driveSpeed, angularSpeed);
     }
   };
 
   const handleEmergencyStop = () => {
+    clearBackupTimeout();
+    sendEnableDocking(false);
     reportNomiNavigationResult('CANCELLED', '긴급 정지로 자동 주행을 취소했습니다.');
     setNavigationStatus('stopped');
     stopContinuousMovement();
@@ -705,14 +981,34 @@ export default function App() {
     sendMoveCommand('stop', 0);
   };
 
+  const handlePoseUpdate = (pose: { x: number; y: number; yaw: number }) => {
+    setLocalPose(pose);
+    saveLastRobotPose(pose);
+  };
+
+  const handleSetRobotPose = (pose: { x: number; y: number; yaw: number }) => {
+    setLocalPose(pose);
+    saveLastRobotPose(pose);
+    socket?.emit('set_robot_pose', pose);
+  };
+
   const handleReset = () => {
+    clearBackupTimeout();
     reportNomiNavigationResult('CANCELLED', '시뮬레이션 초기화로 자동 주행을 취소했습니다.');
     setNavigationStatus('idle');
     setControlDirection(null);
     clearPlannedRoute('simulation_reset');
     setNavigationNotice(null);
-    setLocalPose({ x: 0, y: 0, yaw: 0 });
+    const home = readSavedHome();
+    const resetPose = {
+      x: home?.x ?? INDOOR_MAP.start.x,
+      y: home?.y ?? INDOOR_MAP.start.y,
+      yaw: ((home?.yaw ?? -15.5) * Math.PI) / 180,
+    };
+    setLocalPose(resetPose);
+    saveLastRobotPose(resetPose);
     setResetToken(token => token + 1);
+    socket?.emit('set_robot_pose', resetPose);
     socket?.emit('reset_robot');
   };
 
@@ -724,6 +1020,8 @@ export default function App() {
   };
 
   const stopNavigation = () => {
+    clearBackupTimeout();
+    sendEnableDocking(false);
     reportNomiNavigationResult('CANCELLED', '사용자가 목적지 주행을 취소했습니다.');
     setNavigationStatus('stopped');
     setControlDirection(null);
@@ -731,21 +1029,56 @@ export default function App() {
     sendMoveCommand('stop', 0);
   };
 
+  const handleStartDockingTest = () => {
+    clearBackupTimeout();
+    clearPlannedRoute('docking_test_started');
+    setNavigationStatus('docking');
+    setNavigationNotice('🎯 [단독 테스트] AprilTag 정밀 비전 도킹을 시작합니다...');
+    sendEnableDocking(true);
+  };
+
+  const handleStopDockingTest = () => {
+    sendEnableDocking(false);
+    setNavigationStatus('stopped');
+    setNavigationNotice('🛑 도킹이 사용자에 의해 정지되었습니다.');
+    sendMoveCommand('stop', 0);
+  };
+
+  const handleUndockTest = () => {
+    sendEnableDocking(false);
+    setNavigationStatus('backing_up');
+    setNavigationNotice('🔙 [테스트] 도킹 재시험을 위해 40cm 안전 후진 중...');
+    sendDriveCommand(-0.10, 0, 0);
+    setTimeout(() => {
+      sendMoveCommand('stop', 0);
+      setNavigationStatus('idle');
+      setNavigationNotice('✅ 후진 완료: 이제 다시 도킹 테스트를 시작할 수 있습니다.');
+    }, 4000);
+  };
+
   const persistDestination = (place: Destination) => {
     if (!place.name || !Number.isFinite(place.x) || !Number.isFinite(place.y)
       || place.x < INDOOR_MAP.bounds.minX || place.x > INDOOR_MAP.bounds.maxX
       || place.y < INDOOR_MAP.bounds.minY || place.y > INDOOR_MAP.bounds.maxY) return;
-    const updated = [...savedDestinations.filter(item => item.name !== place.name), place].slice(-30);
+    const cleanPlace: Destination = {
+      name: place.name.trim(),
+      x: place.x,
+      y: place.y,
+      yaw: typeof place.yaw === 'number' && Number.isFinite(place.yaw) ? place.yaw : 0,
+      tag_id: typeof place.tag_id === 'number' ? place.tag_id : undefined,
+      auto_dock: typeof place.auto_dock === 'boolean' ? place.auto_dock : undefined,
+    };
+    const updated = [...savedDestinations.filter(item => item.name !== cleanPlace.name), cleanPlace].slice(-30);
     setSavedDestinations(updated);
     try {
       localStorage.setItem('xlerobot.savedDestinations', JSON.stringify(updated));
     } catch {
       // The current session still keeps saved places if browser storage is blocked.
     }
-    if (place.name.normalize('NFKC').trim() === '집') {
-      setHomeWaypoint(place);
+    if (cleanPlace.name.normalize('NFKC').trim() === '집' || cleanPlace.name === '홈 스테이션') {
+      setHomeWaypoint(cleanPlace);
       try {
-        localStorage.setItem('xlerobot.homeWaypoint', JSON.stringify(place));
+        localStorage.setItem('xlerobot.homeWaypoint', JSON.stringify(cleanPlace));
       } catch {
         // The current session still uses this home waypoint.
       }
@@ -753,7 +1086,89 @@ export default function App() {
   };
 
   const saveDestination = () => {
-    persistDestination({ name: destination.name.trim(), x: destination.x, y: destination.y });
+    persistDestination({
+      name: destination.name.trim(),
+      x: destination.x,
+      y: destination.y,
+      yaw: destination.yaw ?? 0,
+      tag_id: destination.tag_id,
+      auto_dock: destination.auto_dock,
+    });
+  };
+
+  const deleteDestination = (name: string) => {
+    const updated = savedDestinations.filter(item => item.name !== name);
+    setSavedDestinations(updated);
+    try {
+      localStorage.setItem('xlerobot.savedDestinations', JSON.stringify(updated));
+    } catch {
+      // The current session still keeps saved places if browser storage is blocked.
+    }
+  };
+
+  const updateWaypointPosition = (name: string, x: number, y: number, yaw?: number) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)
+      || x < INDOOR_MAP.bounds.minX || x > INDOOR_MAP.bounds.maxX
+      || y < INDOOR_MAP.bounds.minY || y > INDOOR_MAP.bounds.maxY) return;
+    const roundedX = Number(x.toFixed(2));
+    const roundedY = Number(y.toFixed(2));
+    const existing = savedDestinations.find(item => item.name === name);
+    const resolvedYaw = typeof yaw === 'number' && Number.isFinite(yaw)
+      ? yaw
+      : (existing?.yaw ?? destination.yaw ?? 0);
+    const updated = existing
+      ? savedDestinations.map(item => item.name === name ? { ...item, x: roundedX, y: roundedY, yaw: resolvedYaw } : item)
+      : [...savedDestinations, { name, x: roundedX, y: roundedY, yaw: resolvedYaw }];
+
+    setSavedDestinations(updated);
+    try {
+      localStorage.setItem('xlerobot.savedDestinations', JSON.stringify(updated));
+    } catch {
+      // ignore
+    }
+    if (destination.name === name) {
+      setDestination({ ...destination, x: roundedX, y: roundedY, yaw: resolvedYaw });
+    }
+    if (name.normalize('NFKC').trim() === '집' || name === '홈 스테이션') {
+      const homePlace: Destination = { name, x: roundedX, y: roundedY, yaw: resolvedYaw };
+      setHomeWaypoint(homePlace);
+      try {
+        localStorage.setItem('xlerobot.homeWaypoint', JSON.stringify(homePlace));
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const updateWaypointYaw = (name: string, yaw: number) => {
+    if (!Number.isFinite(yaw)) return;
+    const normalizedYaw = Number((((yaw + 180) % 360 + 360) % 360 - 180).toFixed(1));
+    const existing = savedDestinations.find(item => item.name === name);
+    if (!existing) {
+      if (destination.name === name) {
+        setDestination({ ...destination, yaw: normalizedYaw });
+      }
+      return;
+    }
+    const updated = savedDestinations.map(item => item.name === name ? { ...item, yaw: normalizedYaw } : item);
+    setSavedDestinations(updated);
+    try {
+      localStorage.setItem('xlerobot.savedDestinations', JSON.stringify(updated));
+    } catch {
+      // ignore
+    }
+    if (destination.name === name) {
+      setDestination({ ...destination, yaw: normalizedYaw });
+    }
+    if (name.normalize('NFKC').trim() === '집' || name === '홈 스테이션') {
+      const homePlace: Destination = { ...existing, yaw: normalizedYaw };
+      setHomeWaypoint(homePlace);
+      try {
+        localStorage.setItem('xlerobot.homeWaypoint', JSON.stringify(homePlace));
+      } catch {
+        // ignore
+      }
+    }
   };
 
   const currentPosition = hostPositionFresh
@@ -762,7 +1177,7 @@ export default function App() {
   const currentPositionUnavailableReason = status.socket !== 'connected'
     ? '현재 위치를 저장할 수 없습니다. 웹 서버 연결이 없습니다.'
     : simulationState?.host_connected !== true
-      ? '현재 위치를 저장할 수 없습니다. MuJoCo 위치 데이터가 없습니다.'
+      ? '현재 위치를 저장할 수 없습니다. 위치 데이터가 없습니다.'
       : !Number.isFinite(stateAge)
         ? '현재 위치를 저장할 수 없습니다. 위치 데이터 대기 중입니다.'
         : (stateAge as number) > 2.5
@@ -770,7 +1185,15 @@ export default function App() {
           : '현재 위치 좌표가 올바르지 않습니다.';
   const saveCurrentPosition = () => {
     if (!currentPosition || !destination.name.trim()) return;
-    const place = { name: destination.name.trim(), x: currentPosition.x, y: currentPosition.y };
+    const curYawDeg = Number(((navigationPose.yaw * 180 / Math.PI + 180) % 360 - 180).toFixed(1));
+    const place: Destination = {
+      name: destination.name.trim(),
+      x: currentPosition.x,
+      y: currentPosition.y,
+      yaw: curYawDeg,
+      tag_id: destination.tag_id,
+      auto_dock: destination.auto_dock,
+    };
     setDestination(place);
     persistDestination(place);
   };
@@ -793,6 +1216,19 @@ export default function App() {
     onStop={stopNavigation}
     onSaveDestination={saveDestination}
     onSaveCurrentPosition={saveCurrentPosition}
+    onDeleteDestination={deleteDestination}
+    preBackupEnabled={preBackupEnabled}
+    onTogglePreBackup={handleTogglePreBackup}
+    dockingStatus={dockingStatus}
+    onEnableDocking={sendEnableDocking}
+    onMockArmComplete={() => triggerMockArmTaskComplete('fold_towel')}
+    onPublishDockingComplete={() => sendDockingComplete({ destination: destination.name || '테스트 목적지', tag_id: destination.tag_id ?? 1, status: 'DOCKED' })}
+    armTaskComplete={armTaskComplete}
+    onRequestWallAlignment={(target) => requestWallAlignment(target || navigationPose)}
+    wallAlignResult={wallAlignResult}
+    onStartDockingTest={handleStartDockingTest}
+    onStopDockingTest={handleStopDockingTest}
+    onUndockTest={handleUndockTest}
   />;
 
   const socketConnected = status.socket === 'connected';
@@ -843,7 +1279,11 @@ export default function App() {
               connected={socketConnected}
               resetToken={resetToken}
               onReset={handleReset}
-              onPoseUpdate={setLocalPose}
+              onPoseUpdate={handlePoseUpdate}
+              onDestinationChange={editDestination}
+              onSetRobotPose={handleSetRobotPose}
+              onUpdateWaypointPosition={updateWaypointPosition}
+              onUpdateWaypointYaw={updateWaypointYaw}
               destination={destination}
               savedDestinations={savedDestinations}
               plannedRoute={plannedRoute}
@@ -872,6 +1312,7 @@ export default function App() {
               socketStatus={status.socket}
             />
             <NomiPanel socket={socket} theme={theme} />
+            <TowelPlacementPanel />
           </aside>
         </div>
 
@@ -891,7 +1332,7 @@ export default function App() {
               <div className="mt-3">{destinationNavigator}</div>
             </>
           )}
-          {mobilePanel === 'nomi' && <NomiPanel socket={socket} theme={theme} />}
+          {mobilePanel === 'nomi' && <><NomiPanel socket={socket} theme={theme} /><TowelPlacementPanel /></>}
           {mobilePanel === 'status' && (
             <RobotTelemetry state={hostConnected ? simulationState : null} localPose={localPose} speed={speed} moving={isMoving} socketStatus={status.socket} />
           )}

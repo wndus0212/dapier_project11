@@ -34,7 +34,18 @@ class LLMClient:
     def set_profile(self, profile):
         if profile not in MODEL_PROFILES:
             raise ValueError(f"지원하지 않는 모델 프로필: {profile}")
+        old_config = MODEL_PROFILES.get(self.profile) if hasattr(self, "profile") else None
+        old_profile = getattr(self, "profile", None)
         self._apply_config(MODEL_PROFILES[profile], profile)
+        try:
+            if self.router_provider is not None:
+                self.router_provider.verify_available()
+            if self.worker_provider is not None and self.worker_provider is not self.router_provider:
+                self.worker_provider.verify_available()
+        except Exception:
+            if old_config and old_profile:
+                self._apply_config(old_config, old_profile)
+            raise
 
     def _apply_config(self, config, profile=None):
         self.profile = profile or self._profile_for_config(config)
@@ -140,6 +151,9 @@ place_object
 get_robot_state
 get_user_location
 get_weather
+fold_towel
+get_towel_fold_status
+stop_towel_fold
 
 ==================================================
 TASK 규칙
@@ -327,6 +341,51 @@ arguments:
 {
   "location": "주방"
 }
+
+==================================================
+수건 접기
+==================================================
+
+예:
+
+수건 접어줘
+수건 접어봐
+수건 개어줘
+
+intent:
+
+fold_towel
+
+arguments:
+
+{
+  "confirm": true,
+  "wait_s": 60
+}
+
+복합 작업 예 ("책상에 가서 수건 접어줘"):
+
+{
+  "route": "TASK",
+  "type": "task",
+  "intent": "navigate_to",
+  "arguments": {
+    "location": "책상"
+  },
+  "actions": [
+    {"intent": "navigate_to", "arguments": {"location": "책상"}},
+    {"intent": "fold_towel", "arguments": {"confirm": true, "wait_s": 60}}
+  ],
+  "reply": ""
+}
+
+수건 접기 상태 조회 ("수건 접는 상태 확인해줘", "수건 다 접었어?"):
+
+intent: get_towel_fold_status
+
+수건 접기 정지 ("수건 접기 멈춰", "수건 접는 거 중단해"):
+
+intent: stop_towel_fold
 
 ==================================================
 대화 문맥
@@ -568,6 +627,17 @@ to call:
 
 Never ask the user for their city when
 get_user_location is available.
+
+==================================================
+Towel folding rules
+==================================================
+
+1. 이동 요청 없이 '수건 접어줘', '수건 개어줘'라고만 하면 이동하지 않고 바로 fold_towel(confirm=true, wait_s=60)을 호출한다.
+2. 특정 장소로 이동해서 수건 접기를 요청한 경우(예: '책상에 가서 수건 접어줘')에만 먼저 navigate_to로 이동하고, 도착 결과를 돌려받은 뒤에 fold_towel을 호출한다.
+3. fold_towel은 confirm=true, wait_s=60으로 호출한다.
+4. 수건 접기가 진행 중(state가 running)일 때는 주행 도구를 호출하지 않는다.
+5. 시작 후 get_towel_fold_status를 5~10초마다 확인하고, state가 finished/failed/stopped가 되면 verdict로 결과를 보고한다. verdict가 book_fold가 아니면 '대문접기까지 되지 않은 것으로 판정'이라고 보고하며 성공을 단정하지 않는다.
+6. 사용자가 '멈춰'라고 하면 stop_towel_fold를 호출한다.
 
 ==================================================
 Function call schema
@@ -1066,6 +1136,10 @@ Example:
             "반드시 navigate_to(location=사용자가 말한 목적지)만 호출한다. "
             "get_navigation_destinations는 이동 동사가 없는 순수한 목적지 위치·목록 조회 질문에만 호출하고, "
             "실제 결과에 있는 좌표로 답한다. 이 조회는 읽기 전용이며 navigate_to를 호출하지 않는다. "
+            "사용자가 이동이나 특정 장소로 가기를 요청하지 않고 '수건 접어줘', '수건 개어줘'라고만 하면 이동하지 않고 바로 fold_towel(confirm=true, wait_s=60)을 호출한다. "
+            "특정 목적지로 이동하여 수건 접기를 요청한 경우(예: '책상에 가서 수건 접어줘')에만 먼저 navigate_to로 이동한 후 fold_towel을 호출한다. "
+            "수건 접기 진행 중에는 get_towel_fold_status로 상태를 확인하고 완료 시 verdict 결과를 보고한다. "
+            "이동에 실패했으면 fold_towel을 호출하지 않는다. 사용자가 '멈춰'라고 하면 stop_towel_fold를 호출한다. "
             "도구를 호출하지 말고 짧게 확인 질문을 한다. 도구 호출 없이 응답할 때는 한국어로 답한다."
         )
         messages = [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import time
 import uuid
@@ -207,6 +208,8 @@ class ExecutionHarness:
                 self._set_status(record, TaskStatus.SUCCEEDED)
                 self._publish_text(record, no_action_reply)
                 return
+            if self._try_auto_towel_mission(record):
+                return
             if getattr(self.llm_client, "is_single_model_profile", False):
                 # Single model mode skips the separate router request; every
                 # incremental proposal is still checked by Registry/SafetyGuard.
@@ -378,6 +381,51 @@ class ExecutionHarness:
             self._set_status(record, TaskStatus.FAILED, {"code": error_code, "type": type(exc).__name__, "message": str(exc)})
             self._publish_text(record, f"명령 처리 중 오류가 발생했습니다: {exc}")
 
+    def _try_auto_towel_mission(self, record: TaskRecord) -> bool:
+        text = "".join(record.user_text.split())
+        if not re.search(r"수건.{0,20}(?:접어|접기|개어|개기|개줘|접으)", text):
+            return False
+        if classify_no_tool_command(record.user_text)[0] == "NON_ACTION":
+            return False
+        destinations = self.tool_registry.get_navigation_destinations()["data"]["destinations"]
+        matches = [row["name"] for row in destinations if re.search(
+            re.escape("".join(row["name"].split())) + r"(?:으로|로|에)(?:가|이동|향해)", text)]
+        if len(matches) != 1:
+            return False
+        actions = [("navigate_to", {"location": matches[0]}), ("fold_towel", {"confirm": True})]
+        record.actions = [{"intent": name, "arguments": args} for name, args in actions]
+        validated = self.tool_registry.validate_plan(record.actions)
+        safe, checked, message = validate_actions(record.user_text, validated, tool_registry=self.tool_registry)
+        if not safe:
+            self._set_status(record, TaskStatus.FAILED, {"code": "semantic_safety_rejected", "message": message})
+            self._publish_text(record, message)
+            return True
+        record.actions = checked
+        if record.validate_only:
+            self._set_status(record, TaskStatus.VALIDATED)
+            self._publish_text(record, "이동과 수건 접기 순서를 확인했습니다. 실제 동작은 실행하지 않았습니다.")
+            return True
+        towel = self.tool_registry.skills.get("towel_folding")
+        if towel is None:
+            self._set_status(record, TaskStatus.FAILED, {"code": "towel_adapter_unavailable", "message": "수건 접기 기능이 준비되지 않았습니다."})
+            self._publish_text(record, "수건 접기 기능이 준비되지 않아 이동을 시작하지 않았습니다.")
+            return True
+        self._set_status(record, TaskStatus.RUNNING)
+        for action in checked:
+            if record.cancel_event.is_set() or record.halted:
+                return True
+            result = self.execute_tool(record, action["intent"], action.get("arguments", {}))
+            if record.cancel_event.is_set():
+                return True
+            if not result.success:
+                self._set_status(record, TaskStatus.FAILED, {"code": result.data.get("error_code", "tool_failed"),
+                                                            "tool": action["intent"], "message": result.message})
+                self._publish_text(record, f"요청한 작업을 완료하지 못했습니다. {result.message}")
+                return True
+        self._set_status(record, TaskStatus.SUCCEEDED)
+        self._publish_text(record, "도착 후 수건 접기 판정을 완료했습니다.")
+        return True
+
     def execute_tool(self, record: TaskRecord, name: str, arguments: Any):
         if record.cancel_event.is_set() or record.halted:
             from nomi_agent.core.result import SkillResult
@@ -432,7 +480,19 @@ class ExecutionHarness:
                                      data={"validation_only": True, "execution_performed": False})
         started = time.monotonic()
         self._audit("tool_started", record, tool=spec.name, arguments=normalized)
-        result = self.tool_registry.execute(spec.name, normalized, cancel_event=record.cancel_event)
+        compact = "".join(record.user_text.split())
+        compound_towel = ("수건" in compact and any(w in compact for w in ("접어", "접기", "개어", "개줘", "접으"))
+                          and any(w in compact for w in ("이동", "가서", "가줘", "가자", "가고", "가면서", "도착")))
+        if spec.name == "fold_towel" and compound_towel:
+            nav_done = any(step.get("tool") == "navigate_to" and step.get("success") is True for step in record.steps)
+            towel = self.tool_registry.skills.get("towel_folding")
+            if nav_done and towel is not None:
+                result = towel.fold_towel(confirm=True)
+            else:
+                from nomi_agent.core.result import SkillResult
+                result = SkillResult.fail("먼저 도착 완료를 확인해야 합니다.", {"error_code": "arrival_not_verified"})
+        else:
+            result = self.tool_registry.execute(spec.name, normalized, cancel_event=record.cancel_event)
         elapsed = round(time.monotonic() - started, 3)
         self._audit("tool_finished", record, tool=spec.name, arguments=normalized,
                     duration_seconds=elapsed, success=result.success,

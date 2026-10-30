@@ -1,10 +1,9 @@
 {
-  "frame_id": "xlerobot_map",
-  "source": "mujoco_static",
+  "frame_id": "map",
+  "source": "slam_my_map",
   "destinations": [
-    { "name": "테이블 1", "aliases": ["1번 테이블", "1번테이블"], "x": -2.45, "y": -0.4, "kind": "table_approach" },
-    { "name": "테이블 2", "aliases": ["2번 테이블", "2번테이블"], "x": 0.0, "y": 1.5, "kind": "table_approach" },
-    { "name": "테이블 3", "aliases": ["3번 테이블", "3번테이블"], "x": 2.45, "y": -0.4, "kind": "table_approach" },
-    { "name": "충전 위치", "aliases": ["충전소", "충전 도크"], "x": -3.8, "y": 6.8, "kind": "charging" }
+    { "name": "홈 스테이션", "aliases": ["홈", "홈스테이션", "집", "원점", "충전소", "충전 위치", "home"], "x": -0.59, "y": -0.88, "yaw": -17.1, "kind": "charging", "auto_dock": true, "tag_id": 0 },
+    { "name": "책상", "aliases": ["책상", "데스크", "desk", "A", "지점 A", "지점A", "A지점", "물류 픽업", "픽업 구역"], "x": -1.07, "y": -3.15, "yaw": -106.4, "kind": "station", "auto_dock": true, "tag_id": 1, "left_tag_id": 0, "right_tag_id": 1 },
+    { "name": "소파", "aliases": ["소파", "쇼파", "sofa", "B", "지점 B", "지점B", "B지점", "작업 구역 1", "사용자소파", "사용자 소파"], "x": 2.20, "y": -1.75, "yaw": 70.0, "kind": "station", "auto_dock": true, "tag_id": 1 }
   ]
 }

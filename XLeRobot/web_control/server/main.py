@@ -4,12 +4,17 @@ import math
 import json
 import uuid
 import os
+from pathlib import Path
 
 import socketio
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
+import httpx
 from api.streaming import video_manager
+from api.towel_viewer import router as towel_viewer_router
 from core.config import ServerConfig
 from core.remote_core import RemoteCore
 from core.nomi_bridge import NomiBridge
@@ -33,6 +38,7 @@ nomi_navigation_owners: dict[str, str] = {}
 nomi_active_task_id: str | None = None
 nomi_recent_task_id: str | None = None
 nomi_pending_model_switch: dict | None = None
+nomi_active_model: str = 'qwen35_single'
 state_broadcast_task: asyncio.Task | None = None
 NOMI_MOCK_DEV = os.getenv('NOMI_MOCK_DEV', '').strip() == '1'
 NOMI_MUJOCO_NAV_ENABLED = (
@@ -40,7 +46,7 @@ NOMI_MUJOCO_NAV_ENABLED = (
     and not NOMI_MOCK_DEV
     and str(config.robot_type).strip().lower() == 'mujoco'
 )
-MUJOCO_MAP_BOUNDS = {'min_x': -5.0, 'max_x': 5.0, 'min_y': -4.0, 'max_y': 8.0}
+MUJOCO_MAP_BOUNDS = {'min_x': -5.285, 'max_x': 9.815, 'min_y': -13.490, 'max_y': 1.310}
 MUJOCO_NAV_CLEARANCE_M = 0.8
 MUJOCO_HOST_WATCHDOG_S = 0.5
 
@@ -57,6 +63,27 @@ def _decorate_robot_state(state: dict) -> dict:
     decorated = dict(state)
     decorated['navigation_execution_enabled'] = _navigation_execution_enabled()
     decorated['nomi_mock_mode'] = NOMI_MOCK_DEV
+    if nomi_bridge is not None and (getattr(nomi_bridge, 'has_odom', False) or getattr(nomi_bridge, 'obstacle_scan', None)):
+        decorated['robot_type'] = 'amr'
+        decorated['navigation_execution_enabled'] = True
+        decorated['position'] = {'x': nomi_bridge.robot_x, 'y': nomi_bridge.robot_y, 'z': 0.0}
+        decorated['rotation'] = {'yaw': nomi_bridge.robot_yaw, 'roll': 0.0, 'pitch': 0.0}
+        decorated['base_joints'] = [nomi_bridge.robot_x, nomi_bridge.robot_y, nomi_bridge.robot_yaw]
+        decorated['host_connected'] = True
+        decorated['connected'] = True
+        decorated['status'] = 'connected'
+        last_activity = max(getattr(nomi_bridge, 'last_odom_time', 0.0), getattr(nomi_bridge, 'last_scan_time', 0.0))
+        decorated['state_age'] = max(0.0, time.time() - last_activity) if last_activity > 0 else 0.0
+        if nomi_bridge.obstacle_scan:
+            scan_time = getattr(nomi_bridge, 'last_scan_time', 0.0)
+            age_ms = round(max(0.0, (time.time() - scan_time) * 1000.0), 1) if scan_time > 0 else 9999.0
+            scan_status = dict(getattr(nomi_bridge, 'obstacle_scan_status', {}))
+            scan_status['age_ms'] = age_ms
+            scan_status['healthy'] = (age_ms <= 1200.0)
+            decorated['obstacle_scan'] = nomi_bridge.obstacle_scan
+            decorated['obstacle_scan_status'] = scan_status
+    if nomi_bridge is not None and getattr(nomi_bridge, 'docking_status', None):
+        decorated['docking_status'] = nomi_bridge.docking_status
     return decorated
 
 
@@ -92,6 +119,8 @@ async def startup_event():
         on_connection_status=_forward_nomi_bridge_status,
         on_navigation_request=_forward_nomi_navigation_request,
         on_navigation_cancel=_forward_nomi_navigation_cancel,
+        on_docking_status=_forward_docking_status,
+        on_arm_task_complete=_forward_arm_task_complete,
     )
     if nomi_bridge.start():
         print("NOMI ROS 2 bridge started")
@@ -122,38 +151,34 @@ async def shutdown_event():
 
 
 async def _maintain_remote_connection():
-    """Retry the MuJoCo connection and keep publishing current readiness state."""
+    """Maintain connection to robot host or stream ROS odometry telemetry at 20 Hz."""
     connected_at: float | None = None
+    last_reconnect_attempt = 0.0
     while True:
-        if not remote_core.connected:
-            print(f"Attempting {config.robot_type} host connection...")
+        now = time.monotonic()
+        if not remote_core.connected and not (nomi_bridge and getattr(nomi_bridge, 'has_odom', False)) and (now - last_reconnect_attempt >= 10.0):
+            last_reconnect_attempt = now
             if await remote_core.connect():
                 connected_at = time.monotonic()
                 print(f"Remote core connected to {config.robot_type} host successfully")
-            else:
-                state = _decorate_robot_state(await remote_core.get_state())
-                await sio.emit('robot_state_snapshot', {'state': state})
-                await asyncio.sleep(2.0)
-                continue
 
         state = _decorate_robot_state(await remote_core.get_state())
         await sio.emit('robot_state_snapshot', {'state': state})
 
-        last_state_received = remote_core.last_state_received
-        telemetry_stale = last_state_received > 0 and time.time() - last_state_received > 2.5
-        telemetry_missing = (
-            last_state_received <= 0
-            and connected_at is not None
-            and time.monotonic() - connected_at > 3.0
-        )
-        if telemetry_stale or telemetry_missing:
-            print("MuJoCo telemetry became stale; reconnecting remote core")
-            await remote_core.disconnect()
-            connected_at = None
-            await asyncio.sleep(0.2)
-            continue
+        if remote_core.connected:
+            last_state_received = remote_core.last_state_received
+            telemetry_stale = last_state_received > 0 and time.time() - last_state_received > 2.5
+            telemetry_missing = (
+                last_state_received <= 0
+                and connected_at is not None
+                and time.monotonic() - connected_at > 3.0
+            )
+            if telemetry_stale or telemetry_missing:
+                print("MuJoCo telemetry became stale; reconnecting remote core")
+                await remote_core.disconnect()
+                connected_at = None
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
 sio = socketio.AsyncServer(
     async_mode='asgi',
@@ -163,6 +188,7 @@ sio = socketio.AsyncServer(
 )
 
 app = FastAPI(title="XLeRobot Web Control API", version="0.1.0")
+app.include_router(towel_viewer_router)
 
 app.add_event_handler("startup", startup_event)
 app.add_event_handler("shutdown", shutdown_event)
@@ -188,17 +214,18 @@ def _forward_nomi_event(event: str, payload: dict, recipient: str | None = None)
 async def _publish_nomi_task_status(payload: dict) -> None:
     global nomi_active_task_id
     task_id = str(payload.get('task_id', ''))
-    recipient = nomi_task_owners.get(task_id)
-    if not task_id or not recipient:
-        return
-    nomi_task_payloads[task_id] = payload
     if task_id == nomi_active_task_id and payload.get('status') in {'NEEDS_CLARIFICATION', 'VALIDATED', 'SUCCEEDED', 'FAILED', 'CANCELLED'}:
         nomi_active_task_id = None
+    recipient = nomi_task_owners.get(task_id)
+    if not task_id:
+        return
+    nomi_task_payloads[task_id] = payload
     if len(nomi_task_payloads) > 200:
         oldest = next(iter(nomi_task_payloads))
         nomi_task_payloads.pop(oldest, None)
         nomi_task_owners.pop(oldest, None)
-    await sio.emit('nomi_task_status', payload, to=recipient)
+    if recipient:
+        await sio.emit('nomi_task_status', payload, to=recipient)
 
 
 def _forward_nomi_task_status(payload: dict) -> None:
@@ -208,20 +235,25 @@ def _forward_nomi_task_status(payload: dict) -> None:
 
 
 async def _publish_nomi_navigation_request(payload: dict) -> None:
-    # The tool may publish its request immediately before the Harness publishes
-    # terminal SUCCEEDED, so retain the last accepted task as a short routing
-    # fallback after the active slot is cleared.
     task_id = nomi_active_task_id or nomi_recent_task_id
     recipient = nomi_task_owners.get(task_id or "")
     name = str(payload.get('name', '')).strip()
     request_id = str(payload.get('request_id', '')).strip()
-    if not recipient or not name or not request_id:
+    if not name or not request_id:
         return
+
+    # Fallback to connected client if recipient sid is stale or disconnected
+    if not recipient or recipient not in client_states:
+        connected_sids = list(client_states.keys())
+        recipient = connected_sids[0] if connected_sids else None
+
     normalized = ''.join(name.casefold().split()).replace('_', '').replace('-', '')
-    destination = 'home' if normalized in {'집', 'home'} else 'saved'
-    nomi_navigation_owners[request_id] = recipient
-    if len(nomi_navigation_owners) > 200:
-        nomi_navigation_owners.pop(next(iter(nomi_navigation_owners)), None)
+    destination = 'home' if normalized in {'집', 'home', '홈', '홈스테이션', '충전소', '충전위치', '원점'} else 'saved'
+    if recipient:
+        nomi_navigation_owners[request_id] = recipient
+        if len(nomi_navigation_owners) > 200:
+            nomi_navigation_owners.pop(next(iter(nomi_navigation_owners)), None)
+
     await sio.emit('nomi_navigation_request', {
         'destination': destination,
         'name': name,
@@ -247,27 +279,61 @@ def _forward_nomi_navigation_cancel(request_id: str) -> None:
         loop.call_soon_threadsafe(asyncio.create_task, _publish_nomi_navigation_cancel(request_id))
 
 
+async def _publish_docking_status(payload: dict) -> None:
+    await sio.emit('docking_status', payload)
+
+
+def _forward_docking_status(payload: dict) -> None:
+    loop = main_event_loop
+    if loop is not None and not loop.is_closed():
+        loop.call_soon_threadsafe(asyncio.create_task, _publish_docking_status(payload))
+
+
+async def _publish_arm_task_complete(payload: dict) -> None:
+    await sio.emit('arm_task_complete', payload)
+
+
+def _forward_arm_task_complete(payload: dict) -> None:
+    loop = main_event_loop
+    if loop is not None and not loop.is_closed():
+        loop.call_soon_threadsafe(asyncio.create_task, _publish_arm_task_complete(payload))
+
+
 async def _publish_nomi_model_status(value: str) -> None:
-    global nomi_pending_model_switch
+    global nomi_pending_model_switch, nomi_active_model
     pending = nomi_pending_model_switch
-    if pending is None:
-        return
     if value.startswith('ERROR: '):
+        recipient = pending.get('sid') if pending else None
         payload = {
-            'status': 'error', 'profile': pending['profile'],
-            'request_id': pending['request_id'], 'message': value[7:],
+            'status': 'error',
+            'profile': pending['profile'] if pending else '',
+            'request_id': pending['request_id'] if pending else '',
+            'message': value[7:],
         }
-    elif value == pending['profile']:
+        nomi_pending_model_switch = None
+        if recipient:
+            await sio.emit('nomi_model_status', payload, to=recipient)
+        else:
+            await sio.emit('nomi_model_status', payload)
+        return
+
+    if value in MODEL_PROFILES:
+        nomi_active_model = value
+        recipient = pending.get('sid') if pending else None
         payload = {
-            'status': 'success', 'profile': value,
-            'request_id': pending['request_id'],
+            'status': 'success',
+            'profile': value,
+            'request_id': pending['request_id'] if pending else '',
             'label': MODEL_PROFILES[value]['label'],
         }
+        nomi_pending_model_switch = None
+        if recipient:
+            await sio.emit('nomi_model_status', payload, to=recipient)
+            await sio.emit('nomi_model_status', payload, skip_sid=recipient)
+        else:
+            await sio.emit('nomi_model_status', payload)
     else:
         return
-    recipient = pending['sid']
-    nomi_pending_model_switch = None
-    await sio.emit('nomi_model_status', payload, to=recipient)
 
 
 def _forward_nomi_model_status(value: str) -> None:
@@ -281,6 +347,7 @@ async def _publish_nomi_bridge_status(connected: bool, error: str | None) -> Non
     await sio.emit('nomi_bridge_status', {
         'connected': connected,
         'message': 'NOMI Agent 연결됨' if connected else (error or 'NOMI Agent 연결 안 됨'),
+        'active_model': nomi_active_model,
     })
     if not connected and nomi_pending_model_switch is not None:
         pending = nomi_pending_model_switch
@@ -307,7 +374,88 @@ async def get_robot_state(sid):
 @sio.event
 async def reset_robot(sid):
     result = await remote_core.reset()
+    if nomi_bridge is not None:
+        nomi_bridge.set_initial_pose(-0.59, -0.88, math.radians(-17.1))
     await sio.emit('robot_reset_result', result, to=sid)
+
+
+@sio.event
+async def set_robot_pose(sid, data):
+    """Calibrate / relocate robot initial pose on map"""
+    data = data if isinstance(data, dict) else {}
+    try:
+        x = float(data.get('x', -0.59))
+        y = float(data.get('y', -0.88))
+        yaw = float(data.get('yaw', math.radians(-17.1)))
+    except (TypeError, ValueError):
+        return
+    if nomi_bridge is not None:
+        nomi_bridge.set_initial_pose(x, y, yaw)
+    state = _decorate_robot_state(await remote_core.get_state())
+    await sio.emit('robot_state_snapshot', {'state': state})
+
+
+@sio.event
+async def request_wall_alignment(sid, data=None):
+    """Align robot pose with map walls using real-time LiDAR scan matching"""
+    data = data if isinstance(data, dict) else {}
+    if nomi_bridge is None:
+        await sio.emit('wall_alignment_result', {'success': False, 'message': 'ROS 브리지가 연결되지 않았습니다.'}, to=sid)
+        return
+
+    init_x = data.get('x')
+    init_y = data.get('y')
+    init_yaw = data.get('yaw')
+    hint_name = str(data.get('name', '')).strip() or None
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: nomi_bridge.align_with_walls(
+            init_x=float(init_x) if init_x is not None else None,
+            init_y=float(init_y) if init_y is not None else None,
+            init_yaw=float(init_yaw) if init_yaw is not None else None,
+            hint_name=hint_name,
+        )
+    )
+
+    if result.get('success'):
+        state = _decorate_robot_state(await remote_core.get_state())
+        await sio.emit('robot_state_snapshot', {'state': state})
+
+    await sio.emit('wall_alignment_result', result)
+
+
+@sio.event
+async def enable_docking(sid, data):
+    """Enable or disable visual AprilTag precision docking node"""
+    data = data if isinstance(data, dict) else {}
+    enabled = bool(data.get('enabled', True))
+    success = False
+    if nomi_bridge is not None:
+        success = nomi_bridge.set_docking_enabled(enabled)
+    await sio.emit('docking_enabled_result', {'enabled': enabled, 'success': success}, to=sid)
+
+
+@sio.event
+async def report_docking_complete(sid, data):
+    """Publish AMR docking completion to /amr/docking_complete for external robot arm laptop"""
+    payload = data if isinstance(data, dict) else {'status': 'DOCKED'}
+    success = False
+    if nomi_bridge is not None:
+        success = nomi_bridge.publish_docking_complete(payload)
+    await sio.emit('docking_complete_broadcast', {'payload': payload, 'success': success})
+
+
+@sio.event
+async def mock_arm_task_complete(sid, data=None):
+    """Placeholder/Test helper: simulate robot arm completion without second laptop"""
+    payload = data if isinstance(data, dict) else {'status': 'COMPLETED', 'task': 'fold_towel'}
+    success = False
+    if nomi_bridge is not None:
+        success = nomi_bridge.publish_arm_task_complete(payload)
+    await _publish_arm_task_complete(payload)
+    await sio.emit('arm_task_complete_broadcast', {'payload': payload, 'success': success})
 
 
 @sio.event
@@ -337,13 +485,18 @@ async def nomi_command(sid, data):
         return
     if nomi_active_task_id is not None:
         active_status = nomi_task_payloads.get(nomi_active_task_id, {}).get('status')
-        if active_status not in {'NEEDS_CLARIFICATION', 'VALIDATED', 'SUCCEEDED', 'FAILED', 'CANCELLED'}:
+        active_time = nomi_task_payloads.get(nomi_active_task_id, {}).get('_created_at', 0)
+        import time as _t
+        if _t.time() - active_time > 25.0:
+            nomi_active_task_id = None
+        elif active_status not in {'NEEDS_CLARIFICATION', 'VALIDATED', 'SUCCEEDED', 'FAILED', 'CANCELLED'}:
             await sio.emit('nomi_response', {
                 'status': 'error', 'request_id': request_id,
                 'message': f'다른 사용자의 NOMI 작업이 진행 중입니다. 작업 ID: {nomi_active_task_id}',
             }, to=sid)
             return
-        nomi_active_task_id = None
+        else:
+            nomi_active_task_id = None
     if nomi_bridge is None or not nomi_bridge.available or not nomi_bridge.agent_connected:
         await sio.emit('nomi_response', {
             'status': 'error',
@@ -351,8 +504,9 @@ async def nomi_command(sid, data):
             'message': 'NOMI ROS 2 브리지에 연결되지 않아 Harness에 명령을 전달하지 못했습니다.',
         }, to=sid)
         return
+    import time as _t
     nomi_task_owners[request_id] = sid
-    nomi_task_payloads[request_id] = {'task_id': request_id, 'status': 'PENDING'}
+    nomi_task_payloads[request_id] = {'task_id': request_id, 'status': 'PENDING', '_created_at': _t.time()}
     nomi_active_task_id = request_id
     nomi_recent_task_id = request_id
     if not nomi_bridge.send_command(text, request_id, validate_only=validate_only):
@@ -391,8 +545,10 @@ async def nomi_destinations_sync(sid, data):
             continue
         if not isinstance(aliases, list):
             aliases = []
+        yaw = item.get('yaw', 0.0)
         checked.append({
             'name': name.strip(), 'x': float(x), 'y': float(y),
+            'yaw': float(yaw) if isinstance(yaw, (int, float)) and math.isfinite(yaw) else 0.0,
             'aliases': [alias.strip() for alias in aliases[:10]
                         if isinstance(alias, str) and alias.strip() and len(alias) <= 120],
             'kind': str(item.get('kind', 'saved'))[:40],
@@ -404,11 +560,12 @@ async def nomi_destinations_sync(sid, data):
 @sio.event
 async def nomi_task_cancel(sid, data):
     task_id = str((data or {}).get('task_id', '')).strip()
-    if not task_id or nomi_task_owners.get(task_id) != sid or nomi_active_task_id != task_id:
-        await sio.emit('nomi_cancel_result', {
-            'status': 'error', 'task_id': task_id,
-            'message': '이 연결에서 취소할 수 있는 작업을 찾지 못했습니다.',
-        }, to=sid)
+    if nomi_bridge is not None:
+        nomi_bridge.cancel_all_navigation()
+    if not task_id or task_id == 'all' or nomi_task_owners.get(task_id) != sid or nomi_active_task_id != task_id:
+        if nomi_bridge is not None and nomi_bridge.available and nomi_bridge.agent_connected:
+            nomi_bridge.cancel_task(task_id or 'all')
+        await sio.emit('nomi_cancel_result', {'status': 'accepted', 'task_id': task_id or 'all'}, to=sid)
         return
     status = nomi_task_payloads.get(task_id, {}).get('status')
     if status in {'NEEDS_CLARIFICATION', 'VALIDATED', 'SUCCEEDED', 'FAILED', 'CANCELLED'}:
@@ -432,7 +589,7 @@ async def nomi_navigation_result(sid, data):
     request_id = str(payload.get('request_id', '')).strip()
     status = payload.get('status')
     owner = nomi_navigation_owners.get(request_id)
-    if not request_id or owner != sid or status not in {'SUCCEEDED', 'FAILED', 'CANCELLED'}:
+    if not request_id or (owner and owner != sid and len(client_states) > 1) or status not in {'SUCCEEDED', 'FAILED', 'CANCELLED'}:
         await sio.emit('nomi_navigation_result_ack', {
             'status': 'error', 'request_id': request_id,
             'message': '유효한 내비게이션 요청과 결과 상태를 확인하지 못했습니다.',
@@ -450,7 +607,7 @@ async def nomi_navigation_result(sid, data):
             payload.get('completion_verified') is True
             and isinstance(position, dict)
             and all(isinstance(position.get(axis), (int, float)) and math.isfinite(position[axis]) for axis in ('x', 'y'))
-            and isinstance(distance, (int, float)) and math.isfinite(distance) and 0 <= distance <= 0.3
+            and isinstance(distance, (int, float)) and math.isfinite(distance) and 0 <= distance <= 0.35
         )
         if not valid_arrival:
             await sio.emit('nomi_navigation_result_ack', {
@@ -476,11 +633,15 @@ async def nomi_model_switch(sid, data):
     if profile not in MODEL_PROFILES:
         await sio.emit('nomi_model_status', {'status': 'error', 'message': '지원하지 않는 모델 프로필입니다.'}, to=sid)
         return
+    now = time.time()
     if nomi_pending_model_switch is not None:
-        await sio.emit('nomi_model_status', {
-            'status': 'error', 'message': '다른 모델 변경 결과를 확인 중입니다.',
-        }, to=sid)
-        return
+        if now - float(nomi_pending_model_switch.get('timestamp', 0)) > 5.0:
+            nomi_pending_model_switch = None
+        else:
+            await sio.emit('nomi_model_status', {
+                'status': 'error', 'message': '다른 모델 변경 결과를 확인 중입니다.',
+            }, to=sid)
+            return
     request_id = str((data or {}).get('request_id') or uuid.uuid4()).strip()
     if not request_id or len(request_id) > 128:
         await sio.emit('nomi_model_status', {'status': 'error', 'message': '요청 ID 형식이 올바르지 않습니다.'}, to=sid)
@@ -488,7 +649,7 @@ async def nomi_model_switch(sid, data):
     if nomi_bridge is None or not nomi_bridge.available or not nomi_bridge.agent_connected:
         await sio.emit('nomi_model_status', {'status': 'error', 'message': 'NOMI ROS 2 브리지에 연결되지 않았습니다.'}, to=sid)
         return
-    nomi_pending_model_switch = {'sid': sid, 'profile': profile, 'request_id': request_id}
+    nomi_pending_model_switch = {'sid': sid, 'profile': profile, 'request_id': request_id, 'timestamp': now}
     if not nomi_bridge.switch_model(profile):
         nomi_pending_model_switch = None
         await sio.emit('nomi_model_status', {'status': 'error', 'message': 'NOMI ROS 2 브리지에 연결되지 않았습니다.'}, to=sid)
@@ -502,12 +663,172 @@ async def nomi_get_status(sid):
     await sio.emit('nomi_bridge_status', {
         'connected': connected,
         'message': 'NOMI Agent 연결됨' if connected else 'NOMI Agent 연결 안 됨',
+        'active_model': nomi_active_model,
     }, to=sid)
+
+CLIENT_DIST_DIR = Path(__file__).resolve().parent.parent / "client" / "dist"
+if (CLIENT_DIST_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=CLIENT_DIST_DIR / "assets"), name="assets")
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    """Root endpoint - serve production built client UI"""
+    index_file = CLIENT_DIST_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
     return {"message": "XLeRobot Web Control Server is running"}
+
+@app.get("/my_map.png")
+async def get_map_image():
+    map_file = CLIENT_DIST_DIR / "my_map.png"
+    if map_file.exists():
+        return FileResponse(map_file)
+    return {"error": "map image not found"}
+
+@app.get("/vite.svg")
+async def get_vite_svg():
+    vite_file = CLIENT_DIST_DIR / "vite.svg"
+    if vite_file.exists():
+        return FileResponse(vite_file)
+    return {"error": "vite svg not found"}
+
+@app.get("/api/docking_stream")
+async def docking_camera_stream():
+    """Proxy live MJPEG camera feed directly from SBC stream with minimal buffering"""
+    client = httpx.AsyncClient(timeout=10.0)
+    try:
+        req = client.build_request("GET", "http://192.168.0.64:8088/stream.mjpg")
+        r = await client.send(req, stream=True)
+        async def stream_generator():
+            try:
+                async for chunk in r.aiter_raw():
+                    yield chunk
+            finally:
+                await r.aclose()
+                await client.aclose()
+        return StreamingResponse(
+            stream_generator(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        )
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Failed to connect to docking camera: {e}")
+
+@app.get("/api/docking_snapshot")
+async def docking_snapshot():
+    """Fetch on-demand snapshot from SBC"""
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        try:
+            r = await client.get("http://192.168.0.64:8088/snapshot.jpg")
+            if r.status_code == 200:
+                return Response(
+                    content=r.content,
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
+                )
+        except Exception:
+            pass
+    raise HTTPException(status_code=502, detail="Failed to fetch snapshot")
+
+_latest_webcam_frame_bytes = None
+_latest_webcam_frame_time = 0.0
+_midas_net = None
+
+def get_midas_net():
+    global _midas_net
+    if _midas_net is None:
+        model_p = '/home/juyeon/ros2_amr_ws/models/model-small.onnx'
+        if os.path.exists(model_p):
+            import cv2
+            _midas_net = cv2.dnn.readNet(model_p)
+            _midas_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            _midas_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    return _midas_net
+
+@app.post("/api/webcam_frame")
+async def receive_webcam_frame(request: Request):
+    global _latest_webcam_frame_bytes, _latest_webcam_frame_time
+    _latest_webcam_frame_bytes = await request.body()
+    _latest_webcam_frame_time = time.time()
+    return {"status": "ok", "size": len(_latest_webcam_frame_bytes)}
+
+@app.get("/api/webcam_snapshot")
+async def get_webcam_snapshot():
+    global _latest_webcam_frame_bytes
+    if _latest_webcam_frame_bytes:
+        return Response(
+            content=_latest_webcam_frame_bytes,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
+        )
+    raise HTTPException(status_code=404, detail="No webcam frame available yet")
+
+@app.post("/api/depth_pointcloud_web")
+async def depth_pointcloud_web(request: Request):
+    """Processes a 2D webcam image with MiDaS ONNX and returns binary Float32 3D points [x, y, z, r, g, b]"""
+    global _latest_webcam_frame_bytes, _latest_webcam_frame_time
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty image frame")
+
+    _latest_webcam_frame_bytes = body
+    _latest_webcam_frame_time = time.time()
+
+    import cv2
+    import numpy as np
+
+    nparr = np.frombuffer(body, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Decode failed")
+
+    net = get_midas_net()
+    if net is None:
+        raise HTTPException(status_code=500, detail="MiDaS model not available")
+
+    target_w, target_h = 120, 90
+    blob = cv2.dnn.blobFromImage(img, 1.0 / 255.0, (256, 256), (123.675, 116.28, 103.53), swapRB=True, crop=False)
+    net.setInput(blob)
+    disp = net.forward()[0, :, :]
+    disp = cv2.resize(disp, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    img_small = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    norm = (disp - disp.min()) / (disp.max() - disp.min() + 1e-6)
+    z = 0.35 / (norm * 0.12 + (1.0 - norm) * 0.25)
+    z = np.clip(z, 0.25, 3.5)
+
+    u, v = np.meshgrid(np.arange(target_w), np.arange(target_h))
+    fx = fy = 95.0
+    x = (u - target_w / 2.0) * z / fx
+    y = -(v - target_h / 2.0) * z / fy
+    z_3d = -z
+
+    colors = (img_small[:, :, ::-1] / 255.0).astype(np.float32)
+
+    pts = np.stack([
+        x.flatten(),
+        y.flatten(),
+        z_3d.flatten(),
+        colors[:, :, 0].flatten(),
+        colors[:, :, 1].flatten(),
+        colors[:, :, 2].flatten()
+    ], axis=1).astype(np.float32)
+
+    return Response(content=pts.tobytes(), media_type="application/octet-stream")
+
+@app.get("/webcam")
+async def webcam_page():
+    template_path = "/home/juyeon/dapier_project11/XLeRobot/web_control/server/templates/webcam_3d.html"
+    return FileResponse(template_path)
+
+@app.get("/api/time")
+async def get_server_time():
+    return {"t": time.time()}
 
 @app.get("/health")
 async def health_check():
@@ -518,10 +839,25 @@ async def health_check():
         'capabilities': remote_core.get_capabilities()
     }
 
+    bridge_info = {}
+    if nomi_bridge is not None:
+        bridge_info = {
+            'available': nomi_bridge.available,
+            'thread_alive': nomi_bridge._thread.is_alive() if nomi_bridge._thread else False,
+            'agent_connected': nomi_bridge.agent_connected,
+            'has_odom': nomi_bridge.has_odom,
+            'last_scan_time': getattr(nomi_bridge, 'last_scan_time', 0.0),
+            'last_odom_time': getattr(nomi_bridge, 'last_odom_time', 0.0),
+            'last_tf_time': getattr(nomi_bridge, 'last_tf_time', 0.0),
+            'obstacle_scan_len': len(getattr(nomi_bridge, 'obstacle_scan', [])),
+            'error': nomi_bridge.error,
+        }
+
     return {
         "status": "healthy",
         "service": "XLeRobot Web Control",
-        "controller": controller_info
+        "controller": controller_info,
+        "bridge": bridge_info
     }
 
 @app.get("/robot/info")
@@ -531,7 +867,7 @@ async def robot_info():
         'controller_type': config.robot_type,
         'connected': remote_core.connected,
         'capabilities': remote_core.get_capabilities(),
-        'state': await remote_core.get_state() if remote_core.connected else None
+        'state': _decorate_robot_state(await remote_core.get_state())
     }
 
 @app.get("/robot/controllers")
@@ -730,8 +1066,15 @@ async def move_command(sid, data):
 
     # Stops are safety commands: never reject them because of movement throttling.
     if direction == 'stop':
+        if nomi_bridge is not None:
+            nomi_bridge.send_direction('stop')
         if not remote_core.connected:
-            await emit_command_status('error', message='Remote core not connected to robot host')
+            update_client_state(sid, timestamp=current_time)
+            await emit_command_status(
+                'success',
+                robot_state=_decorate_robot_state(await remote_core.get_state()),
+                metrics={'latency': max(0.0, time.time() * 1000 - client_timestamp) if client_timestamp else None},
+            )
             return
         result = await remote_core.stop(sequence=sequence)
         update_client_state(sid, timestamp=current_time)
@@ -746,6 +1089,17 @@ async def move_command(sid, data):
     # as well so stale sensors, non-MuJoCo profiles, and Mock-only mode cannot
     # issue autonomous navigation commands through a hand-crafted socket call.
     if direction == 'drive_vector':
+        if not remote_core.connected:
+            if nomi_bridge is not None:
+                nomi_bridge.send_direction('drive_vector', speed, angular, linear_x, linear_y)
+            update_client_state(sid, timestamp=current_time)
+            await emit_command_status(
+                'success',
+                robot_state=_decorate_robot_state(await remote_core.get_state()),
+                metrics={'latency': max(0.0, time.time() * 1000 - client_timestamp) if client_timestamp else None},
+            )
+            return
+
         if (not NOMI_MUJOCO_NAV_ENABLED or NOMI_MOCK_DEV
                 or str(config.robot_type).strip().lower() != 'mujoco'):
             await emit_command_status(
@@ -800,6 +1154,18 @@ async def move_command(sid, data):
             )
             return
 
+    # 정지 및 긴급 정지 명령은 rate limit이나 throttle 검사를 완전히 우회하여 0ms 즉각 처리
+    if direction == 'stop':
+        if nomi_bridge is not None:
+            nomi_bridge.send_direction('stop')
+        update_client_state(sid, timestamp=current_time)
+        await emit_command_status(
+            'success',
+            robot_state=_decorate_robot_state(await remote_core.get_state()),
+            metrics={'latency': max(0.0, time.time() * 1000 - client_timestamp) if client_timestamp else None},
+        )
+        return
+
     # Check rate limiting
     if not check_rate_limit(sid):
         await emit_command_status(
@@ -822,9 +1188,13 @@ async def move_command(sid, data):
         return
 
     if not remote_core.connected:
+        if nomi_bridge is not None:
+            nomi_bridge.send_direction(direction, speed, angular, linear_x, linear_y)
+        update_client_state(sid, timestamp=current_time)
         await emit_command_status(
-            'error',
-            message='Remote core not connected to robot host',
+            'success',
+            robot_state=_decorate_robot_state(await remote_core.get_state()),
+            metrics={'latency': max(0.0, time.time() * 1000 - client_timestamp) if client_timestamp else None},
         )
         return
 
@@ -839,6 +1209,8 @@ async def move_command(sid, data):
 
     # Execute robot command
     try:
+        if nomi_bridge is not None:
+            nomi_bridge.send_direction(direction, speed, angular, linear_x, linear_y)
         result = await remote_core.move(
             direction, speed, angular, linear_x, linear_y, sequence=sequence,
         )

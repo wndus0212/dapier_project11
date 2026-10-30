@@ -71,6 +71,29 @@ export interface RobotSimulationState {
     status?: 'ok' | 'slow' | 'error';
     error?: string | null;
   };
+  docking_status?: DockingStatus | null;
+}
+
+export interface DockingStatus {
+  state: 'IDLE' | 'SEARCHING' | 'ALIGNING' | 'APPROACHING' | 'STRAIGHT_IN' | 'STRAIGHT_LOCK' | 'DOCKED' | string;
+  tag_detected: boolean;
+  tag_id?: number | null;
+  tag_mode?: string;
+  dist_m?: number | null;
+  dist_err_m?: number | null;
+  lat_err_m?: number | null;
+  yaw_deg?: number | null;
+  heading_deg?: number | null;
+  handover_active?: boolean;
+  cmd_vx?: number;
+  cmd_wz?: number;
+  motion_code?: string;
+  motion_kr?: string;
+  motion_en?: string;
+  backup_count?: number;
+  docking_time_s?: number;
+  flip_180?: boolean;
+  timestamp?: number;
 }
 
 export interface CommandFeedback {
