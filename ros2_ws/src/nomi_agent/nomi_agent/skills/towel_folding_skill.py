@@ -58,16 +58,25 @@ class TowelFoldingSkill:
 
             # 🌟 [지속 도킹 하트비트 스레드]
             # 원격 노트북(LeRobot 정책 서버)은 2.5초 이상 /dock 하트비트가 끊기면
-            # 'dock_not_ready'로 작업을 비상 중단하므로 0.4초 주기로 stopped=True를 지속 전송
+            # 'dock_not_ready'로 작업을 비상 중단하므로 0.3초 주기로 stopped=True를 지속 전송
             stop_heartbeat = threading.Event()
 
             def _dock_heartbeat():
+                consecutive_fails = 0
                 while not stop_heartbeat.is_set():
                     try:
-                        towel_client.call("POST", "/dock", {"event_id": actual_event_id, "stopped": True}, timeout=1)
-                    except Exception:
-                        pass
-                    time.sleep(0.4)
+                        res = towel_client.call("POST", "/dock", {"event_id": actual_event_id, "stopped": True}, timeout=2.5)
+                        if isinstance(res, dict) and res.get("error"):
+                            consecutive_fails += 1
+                            if consecutive_fails % 5 == 0 and self.node:
+                                self.node.get_logger().warn(f"⚠️ [수건 하트비트 지연] /dock 응답 오류: {res['error']}")
+                        else:
+                            consecutive_fails = 0
+                    except Exception as ex:
+                        consecutive_fails += 1
+                        if consecutive_fails % 5 == 0 and self.node:
+                            self.node.get_logger().warn(f"⚠️ [수건 하트비트 통신 예외]: {ex}")
+                    time.sleep(0.3)
 
             hb_thread = threading.Thread(target=_dock_heartbeat, daemon=True)
             hb_thread.start()

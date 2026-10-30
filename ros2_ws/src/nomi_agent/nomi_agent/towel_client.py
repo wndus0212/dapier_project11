@@ -108,21 +108,6 @@ def call(
     base = get_base_url()
     key = get_api_key()
 
-    # 빠른 사전 연결 확인 (서버가 꺼져 있을 때 75초간 무응답 대기 방지)
-    try:
-        from urllib.parse import urlparse
-        import socket
-        parsed = urlparse(base)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        with socket.create_connection((host, port), timeout=2.0):
-            pass
-    except Exception as exc:
-        return {
-            "error": f"수건 접기 서버({base})에 연결할 수 없습니다 ({exc}). 노트북에서 towel_fold_api.py가 실행 중인지와 TOWEL_API_URL을 확인해 주세요.",
-            "started": False,
-        }
-
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
@@ -146,8 +131,8 @@ def call(
             return json.loads(exc.read().decode("utf-8"))
         except Exception:
             return {"error": f"HTTP {exc.code}: {exc.reason}", "started": False}
-    except OSError as exc:
-        return {"error": f"노트북에 연결 실패: {exc}", "started": False}
+    except (OSError, TimeoutError) as exc:
+        return {"error": f"수건 접기 서버({base}) 통신 오류: {exc}", "started": False}
 
 
 TOOL_IMPL = {

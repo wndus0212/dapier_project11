@@ -208,9 +208,15 @@ class NomiBridge:
                         rot = t.transform.rotation
                         yaw = 2.0 * math.atan2(float(rot.z), float(rot.w))
 
+                        # TF 타임스탬프 유효성 검사 (오래된 과거 캐시 TF로 인한 위치 강제 리셋 방지)
+                        tf_time = t.header.stamp.sec + t.header.stamp.nanosec * 1e-9
+                        current_ros_time = self.get_clock().now().nanoseconds * 1e-9
+                        if abs(current_ros_time - tf_time) > 2.5:
+                            return  # AMCL이 멈췄거나 TF가 단절된 경우 오래된 과거 위치로 덮어쓰기 방지
+
                         now = time.time()
-                        # 최근 사용자 시작 위치 재배치(< 1.5초) 보호: AMCL TF가 아직 예전 위치를 가리키고 있다면 덮어쓰기 무시
-                        if now - getattr(bridge, 'last_initial_pose_time', 0.0) < 1.5:
+                        # 최근 사용자 시작 위치 재배치(< 3.0초) 보호: AMCL TF가 아직 예전 위치를 가리키고 있다면 덮어쓰기 무시
+                        if now - getattr(bridge, 'last_initial_pose_time', 0.0) < 3.0:
                             target = getattr(bridge, 'target_initial_pose', None)
                             if target is not None:
                                 dist = math.hypot(trans.x - target['x'], trans.y - target['y'])
